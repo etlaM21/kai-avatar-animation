@@ -1,0 +1,16 @@
+--- Kimodo SOMA Generation Report ---
+Device: NVIDIA GeForce RTX 4090
+Model Load Time: 23.76s
+----------------------------------------
+kick: 2.73 seconds
+sit: 2.47 seconds
+backflip: 2.51 seconds
+carry: 2.47 seconds
+wave: 2.64 seconds
+tie: 2.62 seconds
+throw: 2.67 seconds
+stretch: 2.67 seconds
+sneak: 2.56 seconds
+dance: 2.65 seconds
+----------------------------------------
+Total Batch Processing Time: 25.99s
