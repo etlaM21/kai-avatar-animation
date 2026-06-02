@@ -37,24 +37,30 @@ def purge_blender_data():
 
 def ping_unreal_engine(fbx_path):
     """Signals Unreal Engine via Web Remote Control to ingest the new FBX."""
-    # Note: We will set up the exact receiving Blueprint/Python script in the Node 3 phase.
+    
+    # CRITICAL: Convert Windows backslashes to forward slashes to prevent Python Syntax Errors
+    clean_fbx_path = fbx_path.replace('\\', '/')
+    
     payload = {
-        # This object path will be updated when we build the Unreal side
-        "objectPath": "/Game/Scripts/ImportListener.Default__ImportListener_C", 
+        "objectPath": "/Game/Scripts/ImportListener.Default__ImportListener_C",
         "functionName": "ImportAndRetargetFBX",
         "parameters": {
-            "FilePath": fbx_path
+            # Send the cleaned path here
+            "FilePath": clean_fbx_path 
         }
     }
     
     data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(UE_REMOTE_URL, data=data, headers={'Content-Type': 'application/json'})
+    req = urllib.request.Request(UE_REMOTE_URL, data=data, headers={'Content-Type': 'application/json'}, method='PUT')
     
     try:
-        response = urllib.request.urlopen(req, timeout=5) 
-        print(f"   [Unreal Handoff] Success: Triggered UE Import (HTTP {response.status})")
+        response = urllib.request.urlopen(req, timeout=5)
+        print(f"   [Unreal Handoff] Success: HTTP {response.status}")
+        print(f"   Response: {response.read().decode('utf-8')}")
+    except urllib.error.HTTPError as e:
+        print(f"   [Unreal Handoff] HTTP {e.code}: {e.read().decode('utf-8')}")
     except urllib.error.URLError as e:
-        print(f"   [Unreal Handoff] Warning: Could not reach Unreal Engine at {UE_REMOTE_URL}. Is it running? Error: {e}")
+        print(f"   [Unreal Handoff] Connection failed: {e}")
 
 def run_service():
     context = zmq.Context()
