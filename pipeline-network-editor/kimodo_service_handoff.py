@@ -18,23 +18,13 @@ OUTPUT_DIR = "./kimodo-gen"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BLENDER_ZMQ_PORT = 42070
 
-def get_wsl_host_ip():
-    """Dynamically extracts the Windows Host IP from WSL's network config."""
-    try:
-        with open('/etc/resolv.conf', 'r') as f:
-            for line in f:
-                if line.startswith('nameserver'):
-                    return line.strip().split()[1]
-    except Exception:
-        return "127.0.0.1"
-
-WINDOWS_HOST_IP = get_wsl_host_ip()
-
 # --- ZeroMQ Setup ---
 zmq_context = zmq.Context()
 zmq_socket = zmq_context.socket(zmq.PUSH)
-print(f"Connecting ZMQ to Windows Host at tcp://{WINDOWS_HOST_IP}:{BLENDER_ZMQ_PORT}")
-zmq_socket.connect(f"tcp://{WINDOWS_HOST_IP}:{BLENDER_ZMQ_PORT}")
+
+# Bind to all interfaces inside WSL to bypass the firewall
+zmq_socket.bind(f"tcp://0.0.0.0:{BLENDER_ZMQ_PORT}")
+print(f"ZMQ Push Server listening on 0.0.0.0:{BLENDER_ZMQ_PORT}")
 
 # --- Generation Settings ---
 FPS = 30
@@ -146,10 +136,16 @@ async def generate_motion(payload: GenerationRequest):
         total_time = time.time() - req_start
         print(f"[Success] Request lifecycle finished cleanly. Total Processing Time: {total_time:.2f}s")
 
-        # --- THE BLENDER HANDOFF ---
+       # --- THE BLENDER HANDOFF ---
         abs_output_path = os.path.abspath(output_path)
-        zmq_socket.send_string(abs_output_path)
-        print(f"   [Handoff] Pinged Blender via ZMQ with path: {abs_output_path}")
+        
+        # Convert WSL path to Windows path so Blender can read it
+        windows_path = abs_output_path
+        if windows_path.startswith("/mnt/c/"):
+            windows_path = windows_path.replace("/mnt/c/", "C:\\", 1).replace("/", "\\")
+            
+        zmq_socket.send_string(windows_path)
+        print(f"   [Handoff] Pinged Blender via ZMQ with Windows path: {windows_path}")
         # --------------------------------
         
         return {
