@@ -165,4 +165,7 @@ async def generate_motion(payload: GenerationRequest):
 
 if __name__ == "__main__":
     # Explicit port routing config assignment
-    uvicorn.run("kimodo_service_handoff:app", host="127.0.0.1", port=42069, reload=False)
+    # uvicorn.run("kimodo_service_handoff:app", host="127.0.0.1", port=42069, reload=False)
+
+    # Pass the object 'app' directly instead of the string "kimodo_service_handoff:app"
+    uvicorn.run(app, host="127.0.0.1", port=42069)
