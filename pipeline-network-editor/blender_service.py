@@ -76,7 +76,8 @@ def ping_unreal_engine(fbx_path):
 def run_service():
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
-    socket.bind(f"tcp://127.0.0.1:{ZMQ_PORT}")
+    # socket.bind(f"tcp://127.0.0.1:{ZMQ_PORT}")
+    socket.bind(f"tcp://0.0.0.0:{ZMQ_PORT}") # Fix to listen to WSL ports
     
     print("\n" + "="*60)
     print("Blender Headless Service Online.")
