@@ -1,0 +1,10 @@
+# API and Web components
+fastapi
+uvicorn
+pydantic
+
+# Machine Learning
+torch
+
+# NVIDIA KIMODO
+git+https://github.com/nv-tlabs/kimodo.git
