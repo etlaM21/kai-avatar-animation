@@ -11,12 +11,23 @@ try:
 except ImportError:
     print("\n[CRITICAL ERROR] 'pyzmq' is not installed in Blender's internal Python.")
     print("Please install it using Blender's specific python executable. Example:")
-    print("C:\\Program Files\\Blender Foundation\\Blender 4.0\\4.0\\python\\bin\\python.exe -m pip install pyzmq\n")
+    print("C:\\Program Files\\Blender Foundation\\Blender 5.1\\5.1\\python\\bin\\python.exe -m pip install pyzmq\n")
     sys.exit(1)
 
 # --- Configuration ---
+# 1. Dynamically find the current user's Desktop
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+
+# 2. Define your specific export folder
+OUTPUT_DIR = os.path.join(desktop_path, "blender_kimodo_export_test")
+
+# 3. Create the folder safely
+# The exist_ok=True argument is crucial: it prevents the script from crashing 
+# if you run it a second time and the folder already exists.
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 ZMQ_PORT = 42070
-OUTPUT_DIR = r"K:/work/kai_avatar/ue_project/Kai_Avatar/Content/BVH/FBX_Convert"
+# OUTPUT_DIR = r"K:/work/kai_avatar/ue_project/Kai_Avatar/Content/BVH/FBX_Convert"
 UE_REMOTE_URL = "http://127.0.0.1:30010/remote/object/call"
 
 if not os.path.exists(OUTPUT_DIR):
