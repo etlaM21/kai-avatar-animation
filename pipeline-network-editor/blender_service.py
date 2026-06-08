@@ -14,6 +14,20 @@ except ImportError:
     print("C:\\Program Files\\Blender Foundation\\Blender 5.1\\5.1\\python\\bin\\python.exe -m pip install pyzmq\n")
     sys.exit(1)
 
+# --- LOGGER UTITLITY ---
+from datetime import datetime
+import time
+
+METRICS_FILE = "pipeline_timing_log.txt"
+
+def log_pipeline_step(filename, stage, duration_seconds):
+    """Logs precise stage durations to a shared file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] | File: {filename} | Stage: {stage} | Duration: {duration_seconds:.3f}s\n"
+    
+    with open(METRICS_FILE, "a") as f:
+        f.write(log_line)
+
 # --- Configuration ---
 # 1. Dynamically find the current user's Desktop
 desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -86,9 +100,11 @@ def run_service():
     print("="*60 + "\n")
 
     while True:
+        start_time = time.time()
         # 1. Block and wait for a task. This uses 0% CPU while idle.
         bvh_path = socket.recv_string()
         print(f"\n[Incoming Task] Received: {bvh_path}")
+        
 
         if not os.path.exists(bvh_path):
             print(f"   [Error] File not found: {bvh_path}. Skipping.")
@@ -132,6 +148,8 @@ def run_service():
                 bake_anim_use_nla_strips=False
             )
             print(f"   [Conversion] Clean Export Finished: {fbx_filename}")
+            blender_duration = time.time() - start_time
+            log_pipeline_step(filename, "Blender_Process_And_Export", blender_duration)
 
             # 5. Ping Node 3 (Unreal Engine)
             ping_unreal_engine(fbx_path)

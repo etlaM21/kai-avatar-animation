@@ -12,6 +12,20 @@ from contextlib import asynccontextmanager
 from kimodo.model.load_model import load_model
 from kimodo.exports.bvh import save_motion_bvh
 
+# --- LOGGER UTITLITY ---
+
+from datetime import datetime
+
+METRICS_FILE = "pipeline_timing_log.txt"
+
+def log_pipeline_step(filename, stage, duration_seconds):
+    """Logs precise stage durations to a shared file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] | File: {filename} | Stage: {stage} | Duration: {duration_seconds:.3f}s\n"
+    
+    with open(METRICS_FILE, "a") as f:
+        f.write(log_line)
+
 # --- Configuration ---
 MODEL_NAME = "Kimodo-SOMA-RP-v1.1"
 OUTPUT_DIR = "./kimodo-gen"
@@ -74,6 +88,7 @@ def blocking_inference(long_p: str, output_path: str):
         )
     inf_duration = time.time() - inf_start
     print(f"   [Time Step 1/2] Core Tensor Inference: {inf_duration:.2f}s")
+    log_pipeline_step(output_path, "Kimodo_Inference", inf_duration)
 
     # Step 2: Extract data arrays and serialize file to local I/O storage
     export_start = time.time()
@@ -90,7 +105,8 @@ def blocking_inference(long_p: str, output_path: str):
     )
     export_duration = time.time() - export_start
     print(f"   [Time Step 2/2] BVH File Serialization & I/O Export: {export_duration:.2f}s")
-    
+    log_pipeline_step(output_path, "Kimodo_BVH_Export", export_duration)  
+
     return inf_duration, export_duration
 
 @asynccontextmanager

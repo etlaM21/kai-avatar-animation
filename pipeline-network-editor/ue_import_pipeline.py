@@ -1,5 +1,7 @@
 import unreal
 import os
+import time
+from datetime import datetime
 
 # --- 1. SETTINGS & PATHS ---
 ue_import_path = "/Game/BVH/FBX_Convert"
@@ -47,6 +49,8 @@ def import_fbx_to_skeleton(fbx_file, dest_path, skeleton_asset):
 
 def process_single_fbx(file_path):
     """Main function triggered via Web Remote Control."""
+    # --- START TIMER ---
+    ue_start_time = time.time()
     unreal.log(f"=== Beginning Automated Pipeline Ingestion for: {file_path} ===")
 
     if not os.path.exists(file_path):
@@ -130,6 +134,19 @@ def process_single_fbx(file_path):
                             body_mesh.set_editor_property("animation_data", anim_data)
                             
                             unreal.log(f">> Sequence permanently assigned to Avatar instance: {asset_name}")
+                           
+                            # --- LOGGING TO SHARED FILE ---
+                            ue_duration = time.time() - ue_start_time
+                            
+                            # Hardcode the exact absolute path to your Windows folder
+                            log_path = r"C:\Users\philip\Repos\shk\repos\project_kaspar\modules\kai-avatar-animation\pipeline-network-editor\pipeline_timing_log.txt"
+                            
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            log_line = f"[{timestamp}] | File: {filename} | Stage: Unreal_Import_And_Retarget | Duration: {ue_duration:.3f}s\n"
+                            
+                            with open(log_path, "a") as f:
+                                f.write(log_line)
+                            # ------------------------------
                             
                     else:
                         unreal.log_warning("Could not find an actor of class 'BP_Meta_Avatar' in the current level.")
