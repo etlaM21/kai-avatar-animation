@@ -7,10 +7,10 @@ from datetime import datetime
 ue_import_path = "/Game/BVH/FBX_Convert"
 ue_retarget_path = "/Game/BVH/MetaHuman_Ready"
 
-skeleton_path = "/Game/BVH/FBX_Convert/wave_Skeleton.wave_Skeleton" 
-source_mesh_path = "/Game/BVH/FBX_Convert/wave.wave" 
-target_mesh_path = "/Game/MetaHumans/Meta_Avatar/Body/SKM_Meta_Avatar_BodyMesh.SKM_Meta_Avatar_BodyMesh"
-ik_retargeter_path = "/Game/BVH/RTG_Kimodo_to_MetaHuman.RTG_Kimodo_to_MetaHuman" 
+skeleton_path = "/Game/Kimodo_Export_A-Skeleton.Kimodo_Export_A-Skeleton" 
+source_mesh_path = "/Game/Kimodo_Export_A-SkeletalMesh.Kimodo_Export_A-SkeletalMesh" 
+target_mesh_path = "/Game/MetaHumans/MH_Kaspar/Body/SKM_MH_Kaspar_BodyMesh.SKM_MH_Kaspar_BodyMesh"
+ik_retargeter_path = "/Game/RTG_Kimodo_to_MetaHuman.RTG_Kimodo_to_MetaHuman" 
 
 def import_fbx_to_skeleton(fbx_file, dest_path, skeleton_asset):
     """Imports an FBX and strictly returns the AnimSequence AssetData."""

@@ -108,7 +108,7 @@ def blocking_inference(long_p: str, output_path: str, req_fps: int, req_frames: 
         local_rot_mats=rot_mats, 
         skeleton=skeleton, 
         fps=req_fps,
-        standard_tpose=False 
+        standard_tpose=True 
     )
     export_duration = time.time() - export_start
     print(f"   [Time Step 2/2] BVH File Serialization & I/O Export ({req_fps} FPS): {export_duration:.2f}s")
