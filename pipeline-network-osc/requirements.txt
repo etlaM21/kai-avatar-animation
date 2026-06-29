@@ -1,0 +1,16 @@
+# API and Web components
+fastapi
+uvicorn
+pydantic
+zmq
+
+# Machine Learning
+torch
+
+# NVIDIA KIMODO
+git+https://github.com/nv-tlabs/kimodo.git
+
+# OSC send
+
+python-osc
+scipy
