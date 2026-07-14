@@ -218,23 +218,19 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
                 
                 rot_matrix = rot_np[frame_idx, joint_idx]
                 
-                # SVD Orthogonalization 
+                # SVD Orthogonalization
                 u, s, vh = np.linalg.svd(rot_matrix)
                 clean_rot_matrix = np.dot(u, vh)
                 
                 if kimodo_name == "Hips":
-                    # Root requires World-Space Basis Swap + Handedness Reversal
+                    # Root needs the World-Space basis swap
                     final_rot_matrix = M @ clean_rot_matrix @ M.T
-                    quat = R.from_matrix(final_rot_matrix).as_quat() # SciPy returns X, Y, Z, W
+                    quat = R.from_matrix(final_rot_matrix).as_quat() # X, Y, Z, W
                 else:
-                    # Local bones require ONLY Handedness Reversal (Inverse Rotation)
+                    # Children need pure local deltas. 
+                    # The Control Rig 'Multiply' node and UE5's native FBX Rest Pose 
+                    # will handle the axes automatically.
                     quat = R.from_matrix(clean_rot_matrix).as_quat()
-                    
-                    # Negate X, Y, and Z to invert the rotation direction for LH Unreal Engine
-                    quat[0] = -quat[0]
-                    quat[1] = -quat[1]
-                    quat[2] = -quat[2]
-                    # quat[3] (W) remains unchanged
                 
                 # Append the RAW Kimodo name directly to the payload
                 payload.append(kimodo_name)
