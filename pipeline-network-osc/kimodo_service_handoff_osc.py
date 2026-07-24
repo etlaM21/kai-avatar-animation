@@ -18,7 +18,7 @@ import subprocess
 from kimodo.model.load_model import load_model
 from kimodo.exports.bvh import save_motion_bvh
 
-SCRIPT_VERSION = 0.4
+SCRIPT_VERSION = 0.5
 
 # --- OSC SETUP ---
 # Sending to local machine on port 8000
@@ -171,7 +171,7 @@ METAHUMAN_BONE_MAP = {
 }
 
 def stream_motion_data(root_positions, local_rot_mats, fps):
-    print(f"[@Stream] Beginning OSC broadcast at {fps} FPS...")
+    print(f"[@Stream] Beginning Local Space OSC broadcast at {fps} FPS...")
     
     # 1. Slice [0] to remove the AI Batch Dimension
     pos_np = root_positions.cpu().numpy()[0]  
@@ -180,17 +180,13 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
     num_frames = pos_np.shape[0] 
     frame_time = 1.0 / fps
 
-    # 2. Extract the EXACT bone order directly from the loaded model
     if hasattr(skeleton, 'bone_order_names'):
         soma_joint_names = skeleton.bone_order_names
     else:
         print("[Error] Cannot extract 'bone_order_names' from skeleton object.")
         return
 
-    # SOMA (Y-Up RH) to UE5 (Z-Up LH) Matrix
-    # UE_X (Forward) = SOMA -Z
-    # UE_Y (Right)   = SOMA X
-    # UE_Z (Up)      = SOMA Y
+    # SOMA (Y-Up RH) to UE5 (Z-Up LH) World Matrix for the Root ONLY
     M = np.array([
         [ 0,  0, -1],
         [ 1,  0,  0],
@@ -203,8 +199,6 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
         
         # --- 1. Root Position (Translation) ---
         raw_pos = pos_np[frame_idx].flatten()[0:3]
-        
-        # Apply the world-space conversion matrix to position
         ue_pos = M @ raw_pos
         payload.extend([float(ue_pos[0]), float(ue_pos[1]), float(ue_pos[2])])
         
@@ -223,53 +217,33 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
                 clean_rot_matrix = np.dot(u, vh)
                 
                 if kimodo_name == "Hips":
-                    # Root needs the World-Space basis swap
+                    # Root lives in World Space
                     final_rot_matrix = M @ clean_rot_matrix @ M.T
-                    quat = R.from_matrix(final_rot_matrix).as_quat() # X, Y, Z, W
+                    quat = R.from_matrix(final_rot_matrix).as_quat()
                 else:
-                    # Children need pure local deltas. 
-                    # The Control Rig 'Multiply' node and UE5's native FBX Rest Pose 
-                    # will handle the axes automatically.
+                    # Child bones live in Local Space
                     quat = R.from_matrix(clean_rot_matrix).as_quat()
+                    
+                    # Chiral Flip: Reverse the rotation direction for Left-Handed Unreal
+                    quat[0] = -quat[0]
+                    quat[1] = -quat[1]
+                    quat[2] = -quat[2]
+                    # quat[3] (W) remains unchanged
                 
-                # Append the RAW Kimodo name directly to the payload
+                # Append to payload
                 payload.append(kimodo_name)
                 payload.extend([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])])
         
-        # Send the entire frame (Position + All Mapped Rotations) in one single OSC message
+        # Send OSC message
         osc_client.send_message("/kaspar/frame", payload)
         
-        # Pace the loop to exactly 30 FPS
+        # Pace loop
         elapsed = time.perf_counter() - start_time
         sleep_time = frame_time - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
 
     print("[@Stream] Broadcast complete.")
-
-    '''
-        Sending all data (skipped)
-        for joint_idx, joint_name in enumerate(KIMODO_JOINTS):
-            
-            if joint_idx < rot_np.shape[1]: 
-                # Grab the exact 3x3 matrix for this specific joint on this specific frame
-                rot_matrix = rot_np[frame_idx, joint_idx]
-                
-                # Convert to Quaternion using SciPy
-                r = R.from_matrix(rot_matrix)
-                quat = r.as_quat() 
-                
-                osc_address = f"/kaspar/joint/{joint_name}"
-                osc_client.send_message(osc_address, [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])])
-        
-        
-        # Pace the loop to exactly 30 FPS
-        elapsed = time.perf_counter() - start_time
-        sleep_time = frame_time - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-    print("[@Stream] Broadcast complete.") '''
 
 def blocking_inference(long_p: str, output_path: str, req_fps: int, req_frames: int, req_steps: int, req_seed: int | None):
     """
