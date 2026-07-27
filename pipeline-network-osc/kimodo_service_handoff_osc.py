@@ -18,7 +18,7 @@ import subprocess
 from kimodo.model.load_model import load_model
 from kimodo.exports.bvh import save_motion_bvh
 
-SCRIPT_VERSION = 0.5
+SCRIPT_VERSION = 0.67
 
 # --- OSC SETUP ---
 # Sending to local machine on port 8000
@@ -202,38 +202,68 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
         ue_pos = M @ raw_pos
         payload.extend([float(ue_pos[0]), float(ue_pos[1]), float(ue_pos[2])])
         
-        # --- 2. Joint Rotations ---
+       # --- 2. Joint Rotations ---
         for joint_idx, kimodo_name in enumerate(soma_joint_names):
-            if joint_idx < rot_np.shape[1]: 
+            if joint_idx >= rot_np.shape[1]: 
+                continue
                 
-                # Filter out useless end effectors
-                if kimodo_name.endswith("End") or kimodo_name in ["Jaw", "LeftEye", "RightEye"]:
-                    continue
+            # Filter out useless end effectors
+            if kimodo_name.endswith("End") or kimodo_name in ["Jaw", "LeftEye", "RightEye"]:
+                continue
+
+            rot_matrix = rot_np[frame_idx, joint_idx]
+            
+            # SVD Orthogonalization
+            u, s, vh = np.linalg.svd(rot_matrix)
+            clean_rot_matrix = np.dot(u, vh)
+            
+            # Convert to base Quaternion
+            quat = R.from_matrix(clean_rot_matrix).as_quat()
+
+            # 1. Standard Chiral Flip for ALL bones (SOMA RH -> UE5 LH)
+            quat[0] = -quat[0]
+            quat[1] = -quat[1]
+            quat[2] = -quat[2]
+            # quat[3] (W) remains unchanged
+
+            # 2. Targeted Leg Axis Routing (The Blender BVH Fix)
+            if "Leg" in kimodo_name or "Shin" in kimodo_name or "Foot" in kimodo_name or "Toe" in kimodo_name:
+                # Blender rotated the leg bone rolls 90 degrees during import.
+                # We swap X (SOMA's pitch) with Z (Blender's assigned pitch).
+                temp_x = quat[0]
+                quat[0] = quat[2]
+                quat[2] = temp_x
+
+            # 3. Targeted UPPER ARM (Shoulder, Arm)
+            elif kimodo_name in ["LeftShoulder", "LeftArm", "RightShoulder", "RightArm"]:
+                # The X/Y Swap worked to bring the arms down
+                temp_x = quat[0]
+                quat[0] = quat[1]
+                quat[1] = temp_x
                 
-                rot_matrix = rot_np[frame_idx, joint_idx]
-                
-                # SVD Orthogonalization
-                u, s, vh = np.linalg.svd(rot_matrix)
-                clean_rot_matrix = np.dot(u, vh)
-                
-                if kimodo_name == "Hips":
-                    # Root lives in World Space
-                    final_rot_matrix = M @ clean_rot_matrix @ M.T
-                    quat = R.from_matrix(final_rot_matrix).as_quat()
-                else:
-                    # Child bones live in Local Space
-                    quat = R.from_matrix(clean_rot_matrix).as_quat()
-                    
-                    # Chiral Flip: Reverse the rotation direction for Left-Handed Unreal
+                # Un-mirror the Left side
+                if "Left" in kimodo_name:
                     quat[0] = -quat[0]
                     quat[1] = -quat[1]
                     quat[2] = -quat[2]
-                    # quat[3] (W) remains unchanged
+
+            # 4. Targeted LOWER ARM (ForeArm, Hand)
+            elif kimodo_name in ["LeftForeArm", "LeftHand", "RightForeArm", "RightHand"]:
+                # The final permutation: Swapping X and Z (same as the legs)
+                temp_x = quat[0]
+                quat[0] = quat[2]
+                quat[2] = temp_x
                 
-                # Append to payload
-                payload.append(kimodo_name)
-                payload.extend([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])])
-        
+                # Un-mirror the Left side to match the upper arm
+                if "Left" in kimodo_name:
+                    quat[0] = -quat[0]
+                    quat[1] = -quat[1]
+                    quat[2] = -quat[2]
+
+            # Append to payload
+            payload.append(kimodo_name)
+            payload.extend([float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])])
+    
         # Send OSC message
         osc_client.send_message("/kaspar/frame", payload)
         
