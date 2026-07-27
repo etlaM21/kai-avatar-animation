@@ -224,8 +224,8 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
             clean_world_matrix = np.dot(u, vh)
                 
             # Transform the calculated absolute world matrix into Unreal's coordinate basis
-            ue5_world_matrix = M @ clean_world_matrix @ M.T
-            
+            ue5_world_matrix = M @ clean_world_matrix.T @ M.T        
+               
             # Convert directly to absolute Quaternion [X, Y, Z, W]
             quat = R.from_matrix(ue5_world_matrix).as_quat()
             
