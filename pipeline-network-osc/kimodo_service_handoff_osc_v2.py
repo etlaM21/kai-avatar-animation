@@ -18,7 +18,7 @@ import subprocess
 from kimodo.model.load_model import load_model
 from kimodo.exports.bvh import save_motion_bvh
 
-SCRIPT_VERSION = 0.71
+SCRIPT_VERSION = 0.74
 
 # --- OSC SETUP ---
 # Sending to local machine on port 8000
@@ -170,6 +170,12 @@ METAHUMAN_BONE_MAP = {
     "RightToeBase": "ball_r", #"RightToeEnd",
 }
 
+def clean_rotation(rot_matrix):
+    u, s, vh = np.linalg.svd(rot_matrix)
+    d = np.sign(np.linalg.det(u @ vh))
+    correction = np.diag([1, 1, d])
+    return u @ correction @ vh
+
 def stream_motion_data(root_positions, local_rot_mats, fps):
     print(f"[@Stream] Beginning Local Space OSC broadcast at {fps} FPS...")
     
@@ -212,24 +218,35 @@ def stream_motion_data(root_positions, local_rot_mats, fps):
                 continue
 
             rot_matrix = rot_np[frame_idx, joint_idx]
-            u, s, vh = np.linalg.svd(rot_matrix)
-            clean_rot_matrix = np.dot(u, vh)
+            clean_rot_matrix = clean_rotation(rot_matrix)
+
+            # --- DIAGNOSTIC LOGGING ---
+            # Convert the raw matrix to human-readable Euler degrees
+            '''raw_euler = R.from_matrix(clean_rot_matrix).as_euler('xyz', degrees=True)
+            
+            if kimodo_name in ARM_CHAIN and frame_idx % 15 == 0:
+                print(f"Frame {frame_idx} | {kimodo_name} RAW Euler -> X: {raw_euler[0]:>6.1f}° | Y: {raw_euler[1]:>6.1f}° | Z: {raw_euler[2]:>6.1f}°")'''
+            # --------------------------
+
             quat = R.from_matrix(clean_rot_matrix).as_quat()
 
-            if kimodo_name in ARM_CHAIN:
+            if kimodo_name == "RightForeArm" or kimodo_name == "LeftForeArm":
                 final_quat = [quat[0], quat[2], -quat[1], quat[3]]
-                if kimodo_name == "RightForeArm":
-                    if frame_idx % 10 == 0:
-                        print(f"Frame {frame_idx}: {kimodo_name} raw bend angle = "
-                            f"{np.degrees(2 * np.arccos(np.clip(abs(quat[3]), -1.0, 1.0))):.1f}°, "
-                            f"sending {final_quat}")
+                '''if frame_idx % 5 == 0:
+                    print(f"Frame {frame_idx}: {kimodo_name} raw bend angle = "
+                        f"{np.degrees(2 * np.arccos(np.clip(abs(quat[3]), -1.0, 1.0))):.1f}°, "
+                        f"sending {final_quat}")'''
+            elif kimodo_name == "RightArm" or kimodo_name == "LeftArm":
+                final_quat = [quat[0], -quat[2], quat[1], quat[3]]
+            elif kimodo_name == "RightShoulder" or kimodo_name == "LeftShoulder":
+                final_quat = [quat[0], quat[1], -quat[2], quat[3]]
+            elif kimodo_name in ("LeftHand", "RightHand"):
+                final_quat = [quat[0], quat[2], -quat[1], quat[3]]
+            elif kimodo_name in ARM_CHAIN:
+                final_quat = [quat[0], quat[1], -quat[2], quat[3]]
             else:
                 final_quat = [quat[0], quat[1], -quat[2], -quat[3]]
-                if kimodo_name == "RightLeg":
-                    if frame_idx % 10 == 0:
-                        print(f"Frame {frame_idx}: {kimodo_name} raw bend angle = "
-                            f"{np.degrees(2 * np.arccos(np.clip(abs(quat[3]), -1.0, 1.0))):.1f}°, "
-                            f"sending {final_quat}")
+
             payload.append(kimodo_name)
             payload.extend([float(final_quat[0]), float(final_quat[1]), float(final_quat[2]), float(final_quat[3])])
     
