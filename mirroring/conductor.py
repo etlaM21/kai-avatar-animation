@@ -62,6 +62,8 @@ from mediapipe_pose_osc_protocol import (
     PoseOSCEncoder,
     pose_landmark_channel_prefix,
 )
+from pose_solver import BoneTransform, PoseSolver
+from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder
  
 LIVE_LINK_FACE_PORT = 11111  # Unreal's stock Live Link Face plugin default
 POSE_OSC_PORT = 9001         # arbitrary - must match whatever the custom LiveLink Source ends up listening on
@@ -131,12 +133,17 @@ class Conductor:
         }
  
         # --- pose channel: transform state + network target ---
-        self.pose_smoother = Smoother(alpha=pose_smoothing_alpha)
-        self.pose_encoder = PoseOSCEncoder()
-        self.pose_osc_client = SimpleUDPClient(pose_ip, pose_port)
-        self._last_valid_pose_values: dict[str, float] = {
-            name: 0.0 for name in POSE_CHANNEL_ORDER
-        }
+        # self.pose_smoother = Smoother(alpha=pose_smoothing_alpha)
+        # self.pose_encoder = PoseOSCEncoder()
+        # self.pose_osc_client = SimpleUDPClient(pose_ip, pose_port)
+        # self._last_valid_pose_values: dict[str, float] = {
+        #    name: 0.0 for name in POSE_CHANNEL_ORDER
+        #}
+
+        # --- pose channel: transform state + network target ---
+        self.pose_solver = PoseSolver()
+        self.pose_encoder = LiveLinkPoseOSCEncoder(ip=pose_ip, port=pose_port)
+        self._last_valid_bone_transforms: list[BoneTransform] = []
  
     # ---- timing ---------------------------------------------------------
  
@@ -191,6 +198,20 @@ class Conductor:
         self.face_socket.sendto(packet, self.face_target)
  
     def _handle_pose(self, frame: PoseFrame, timestamp_ms: int) -> None:
+        if frame.valid and len(frame.world_landmarks) > 0:
+            # Solve landmarks into 22 local bone quaternions
+            bone_transforms = self.pose_solver.solve(frame.world_landmarks)
+            self._last_valid_bone_transforms = bone_transforms
+            self.pose_encoder.send(bone_transforms, present=True)
+        else:
+            # Hold the last valid rig pose if tracking drops out
+            transforms_to_send = (
+                self._last_valid_bone_transforms
+                if self._last_valid_bone_transforms
+                else self.pose_solver.solve([]) # Fallback to identity rest pose
+            )
+            self.pose_encoder.send(transforms_to_send, present=False)
+        '''
         present = frame.valid  # the flag Live Link Face's protocol has no room for -> validates that a pose is currently present
         if frame.valid:
             raw_values = self._pose_frame_to_channel_values(frame)
@@ -201,6 +222,7 @@ class Conductor:
         smoothed = self.pose_smoother.apply(raw_values)
         args = self.pose_encoder.build_args(smoothed, present=present, timestamp_ms=timestamp_ms)
         self.pose_osc_client.send_message(self.pose_encoder.address, args)
+        '''
  
     # ---- debug overlay -----------------------------------------------------
  
