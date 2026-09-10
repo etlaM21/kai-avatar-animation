@@ -48,10 +48,11 @@ import argparse
 import socket
 import time
 from pathlib import Path
- 
+
 import cv2
 import mediapipe as mp
 from pythonosc.udp_client import SimpleUDPClient
+import numpy as np
  
 from live_link_face_protocol import CHANNEL_ORDER as FACE_CHANNEL_ORDER
 from live_link_face_protocol import LiveLinkFaceEncoder
@@ -80,10 +81,8 @@ _UNRESOLVED_EYE_CHANNELS = (
 class Smoother:
     """Simple per-channel exponential moving average filter.
  
-    Generic over any dict[str, float] - used as two independent
-    instances below, one for the face channel and one for the pose
-    channel, each with its own internal state, so smoothing one never
-    affects the other and each can be tuned separately.
+    Generic over any dict[str, float] - used as one independent
+    instance for the face channel with its own internal state.
     """
  
     def __init__(self, alpha: float = 0.5) -> None:
@@ -97,6 +96,72 @@ class Smoother:
             prev = self._state.get(name, value)
             self._state[name] = self.alpha * value + (1.0 - self.alpha) * prev
         return dict(self._state)
+    
+class PoseSmoother:
+    """
+    Applies Exponential Moving Average (EMA) to 3D position vectors and 
+    Normalized Linear Interpolation (NLERP) to 4D rotation quaternions.
+    Used to smooth the pose channel with its own internal state.
+    """
+
+    def __init__(self, alpha: float = 0.5) -> None:
+        self.alpha = alpha  # 0 to 1: lower = smoother but laggier
+        # Stores the previous frame's fully smoothed bone transforms
+        self._state: dict[str, BoneTransform] = {}
+
+    def apply(self, current_bones: list[BoneTransform]) -> list[BoneTransform]:
+        smoothed_bones = []
+        
+        for curr in current_bones:
+            # First time seeing this bone, start at its own value
+            if curr.name not in self._state:
+                self._state[curr.name] = curr
+                smoothed_bones.append(curr)
+                continue
+            
+            prev = self._state[curr.name]
+            
+            # --- 1. Position Smoothing (Standard EMA) ---
+            # P_new = alpha * P_curr + (1 - alpha) * P_prev
+            px = self.alpha * curr.position["x"] + (1.0 - self.alpha) * prev.position["x"]
+            py = self.alpha * curr.position["y"] + (1.0 - self.alpha) * prev.position["y"]
+            pz = self.alpha * curr.position["z"] + (1.0 - self.alpha) * prev.position["z"]
+            smoothed_pos = {"x": px, "y": py, "z": pz}
+            
+            # --- 2. Rotation Smoothing (NLERP) ---
+            q_curr = np.array([curr.rotation["x"], curr.rotation["y"], curr.rotation["z"], curr.rotation["w"]])
+            q_prev = np.array([prev.rotation["x"], prev.rotation["y"], prev.rotation["z"], prev.rotation["w"]])
+            
+            # Quaternions "double-cover" 3D rotations: q and -q represent the exact same pose.
+            # If the dot product is negative, the quaternions are pointing in opposite 4D hemispheres.
+            # We must flip one to ensure we blend across the shortest path, avoiding a 360-degree spin.
+            if np.dot(q_curr, q_prev) < 0.0:
+                q_curr = -q_curr
+                
+            # Step A: Standard linear blend
+            q_blended = self.alpha * q_curr + (1.0 - self.alpha) * q_prev
+            
+            # Step B: Normalize back to a unit quaternion (length = 1)
+            norm = np.linalg.norm(q_blended)
+            if norm > 1e-6:
+                q_blended = q_blended / norm
+            else:
+                # Math fallback: if normalization fails due to bad data, hold the previous frame
+                q_blended = q_prev
+                
+            smoothed_rot = {
+                "x": float(q_blended[0]), 
+                "y": float(q_blended[1]), 
+                "z": float(q_blended[2]), 
+                "w": float(q_blended[3])
+            }
+            
+            # --- 3. Package and Store ---
+            smoothed_bone = BoneTransform(name=curr.name, rotation=smoothed_rot, position=smoothed_pos)
+            self._state[curr.name] = smoothed_bone
+            smoothed_bones.append(smoothed_bone)
+            
+        return smoothed_bones
 
 class Conductor:
     def __init__(
@@ -139,6 +204,8 @@ class Conductor:
         # self._last_valid_pose_values: dict[str, float] = {
         #    name: 0.0 for name in POSE_CHANNEL_ORDER
         #}
+        
+        self.pose_smoother = PoseSmoother(alpha=pose_smoothing_alpha)
 
         # --- pose channel: transform state + network target ---
         self.pose_solver = PoseSolver()
@@ -199,10 +266,13 @@ class Conductor:
  
     def _handle_pose(self, frame: PoseFrame, timestamp_ms: int) -> None:
         if frame.valid and len(frame.world_landmarks) > 0:
-            # Solve landmarks into 22 local bone quaternions
-            bone_transforms = self.pose_solver.solve(frame.world_landmarks)
-            self._last_valid_bone_transforms = bone_transforms
-            self.pose_encoder.send(bone_transforms, present=True)
+            # Get raw solved bones from MediaPipe
+            raw_bones = self.pose_solver.solve(frame.world_landmarks)
+            self._last_valid_bone_transforms = raw_bones
+
+            # Apply quaternion-safe smoothing
+            smoothed_bones = self.pose_smoother.apply(raw_bones)
+            self.pose_encoder.send(smoothed_bones, present=True)
         else:
             # Hold the last valid rig pose if tracking drops out
             transforms_to_send = (
