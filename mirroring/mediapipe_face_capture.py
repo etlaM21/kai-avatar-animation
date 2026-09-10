@@ -1,14 +1,28 @@
 """
-MediaPipe Face capture module (LIVE_STREAM mode).
+MediaPipe Face capture module - the "MediaPipe Face" detector.
 
-Uses MediaPipe Tasks' asynchronous LIVE_STREAM running mode and provides
-an optional OpenCV debug overlay for webcam feed and facial landmarks.
+Pure ML inference wrapper: given an already-captured frame (as an
+mp.Image) and a timestamp, runs FaceLandmarker (Tasks API, LIVE_STREAM
+mode) and returns a FaceFrame. Does NOT own a webcam - Conductor owns
+the single shared camera and hands the same frame to this and to
+MediaPipePoseCapture, so both detectors see exactly the same image at
+exactly the same moment, from one physical device. (Two processes each
+independently opening cv2.VideoCapture(0) is what we're avoiding here -
+most webcams only allow one reader at a time.)
+
+Requires:
+    pip install mediapipe opencv-python numpy
+
+Model:
+    Download the FaceLandmarker model bundle from:
+    https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+    save it as face_landmarker.task next to this script, or pass
+    --face-model to conductor.py.
 """
 
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -20,17 +34,16 @@ from mediapipe.tasks.python.vision import (
     FaceLandmarkerOptions,
     FaceLandmarkerResult,
     RunningMode,
-    drawing_utils,
-    drawing_styles,
-    FaceLandmarksConnections
 )
 
 
 @dataclass
 class FaceFrame:
-    """Tracking data and optional visual frame for debugging."""
-    valid: bool
+    """One frame's worth of face tracking data, ready to hand to Conductor."""
+
+    valid: bool  # True only if a face was actually found this frame
     timestamp_ms: int
+    # ARKit blendshape name -> score. 52 entries when valid, empty otherwise.
     blendshapes: dict[str, float] = field(default_factory=dict)
     head_yaw_deg: float = 0.0
     head_pitch_deg: float = 0.0
@@ -38,38 +51,39 @@ class FaceFrame:
 
 
 def _rotation_matrix_to_euler(matrix: np.ndarray) -> tuple[float, float, float]:
-    """Decomposes the 4x4 transform into correctly mapped yaw, pitch, and roll (degrees)."""
-    # Append a zero-translation column to make it a valid 3x4 projection matrix
+    """Decomposes the 3x3 rotation part of MediaPipe's 4x4 transform into
+    yaw/pitch/roll (degrees), via OpenCV's projection-matrix decomposition.
+
+    This is the approach already tuned by hand against the Engine (note
+    the pitch sign flip below) - kept as-is rather than reverting to a
+    from-scratch version, since it was already verified against a real
+    turning head rather than guessed at.
+    """
+    # decomposeProjectionMatrix expects a 3x4 projection matrix; a plain
+    # rotation matrix with a zero translation column is a valid special
+    # case of one (no extra camera intrinsics involved here).
     proj_matrix = np.hstack((matrix[:3, :3], np.zeros((3, 1))))
-    
-    # Use OpenCV to robustly extract Euler angles from the camera-space matrix
     _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(proj_matrix)
-    
-    # cv2 returns axes in the order: Pitch (X), Yaw (Y), Roll (Z)
+
+    # cv2 returns the three angles in the order [pitch(x), yaw(y), roll(z)].
     pitch_x, yaw_y, roll_z = euler_angles.flatten()
-    
+
+    # Empirically-tuned sign flip on pitch, verified against the Engine.
     return float(yaw_y), float(-pitch_x), float(roll_z)
 
 
 class MediaPipeFaceCapture:
-    """Captures webcam video using MediaPipe LIVE_STREAM asynchronous mode."""
+    """Wraps FaceLandmarker. Owns no camera - call process() once per frame."""
 
-    def __init__(
-        self,
-        model_path: str = "face_landmarker.task",
-        camera_index: int = 0,
-        show_debug: bool = False,
-    ) -> None:
-        self.show_debug = show_debug
-        self.cap = cv2.VideoCapture(camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open camera index {camera_index}")
-
+    def __init__(self, model_path: str = "face_landmarker.task") -> None:
+        # A lock is required because detect_async() runs the model on a
+        # MediaPipe-internal worker thread; _on_result() below fires on
+        # that thread, while process() reads the result from whichever
+        # thread Conductor's main loop runs on. Without this, the two
+        # threads could race on _latest_result.
         self._lock = threading.Lock()
         self._latest_result: FaceLandmarkerResult | None = None
-        self._start_time = time.perf_counter()
 
-        # Configure Tasks API for Live Stream mode
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
             running_mode=RunningMode.LIVE_STREAM,
@@ -89,86 +103,41 @@ class MediaPipeFaceCapture:
         output_image: mp.Image,
         timestamp_ms: int,
     ) -> None:
-        """Asynchronous callback executed when inference completes."""
+        """Called by MediaPipe on its own worker thread once inference for
+        a dispatched frame finishes. Just stashes the result - process()
+        below decides what to do with it."""
         with self._lock:
             self._latest_result = result
 
-    def _timestamp_ms(self) -> int:
-        return int((time.perf_counter() - self._start_time) * 1000)
+    def process(self, mp_image: mp.Image, timestamp_ms: int) -> FaceFrame:
+        """Dispatches one frame for (async) detection and returns whatever
+        the most recently *completed* detection produced.
 
-    def read(self) -> FaceFrame:
-        """Grabs a frame, triggers async inference, and optionally draws debug overlay."""
-        ts = self._timestamp_ms()
-        success, frame = self.cap.read()
-        if not success:
-            return FaceFrame(valid=False, timestamp_ms=ts)
+        LIVE_STREAM subtlety worth remembering: because detect_async()
+        doesn't block, the FaceFrame returned here reflects the previous
+        completed detection, not necessarily the frame just dispatched -
+        there's a small, unavoidable lag of roughly one processing cycle.
+        timestamp_ms below is the capture time you passed in, not
+        necessarily the exact moment the returned detection finished.
+        """
+        self.landmarker.detect_async(mp_image, timestamp_ms)
 
-        # Convert OpenCV BGR image to MediaPipe Image and dispatch inference
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        self.landmarker.detect_async(mp_image, ts)
-
-        # Retrieve the latest async result safely
         with self._lock:
             result = self._latest_result
 
-        valid = False
-        blendshapes: dict[str, float] = {}
+        if not result or not result.face_blendshapes:
+            return FaceFrame(valid=False, timestamp_ms=timestamp_ms)
+
+        blendshapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
+
         yaw = pitch = roll = 0.0
-
-        if result and result.face_landmarks and result.face_blendshapes:
-            valid = True
-            blendshapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
-
-            if result.facial_transformation_matrixes:
-                matrix = np.array(result.facial_transformation_matrixes[0])
-                yaw, pitch, roll = _rotation_matrix_to_euler(matrix)
-
-            # Draw visual landmarks on the debug window
-            if self.show_debug:
-                h, w, _ = frame.shape
-                annotated_image = frame
-                face_landmarks = result.face_landmarks[0]
-
-                # Draw the face landmarks using Google's example: https://colab.research.google.com/github/googlesamples/mediapipe/blob/main/examples/face_landmarker/python/%5BMediaPipe_Python_Tasks%5D_Face_Landmarker.ipynb
-                drawing_utils.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=drawing_styles.get_default_face_mesh_tesselation_style())
-                drawing_utils.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=drawing_styles.get_default_face_mesh_contours_style())
-                drawing_utils.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=FaceLandmarksConnections.FACE_LANDMARKS_LEFT_IRIS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style())
-                drawing_utils.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_IRIS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style())
-
-        if self.show_debug:
-            status = "TRACKING" if valid else "SEARCHING"
-            color = (0, 255, 0) if valid else (0, 0, 255)
-            cv2.putText(
-                frame, f"Status: {status}", (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2
-            )
-            cv2.imshow("MediaPipe LiveLink Debug", frame)
-            cv2.waitKey(1)
+        if result.facial_transformation_matrixes:
+            matrix = np.array(result.facial_transformation_matrixes[0])
+            yaw, pitch, roll = _rotation_matrix_to_euler(matrix)
 
         return FaceFrame(
-            valid=valid,
-            timestamp_ms=ts,
+            valid=True,
+            timestamp_ms=timestamp_ms,
             blendshapes=blendshapes,
             head_yaw_deg=yaw,
             head_pitch_deg=pitch,
@@ -176,7 +145,4 @@ class MediaPipeFaceCapture:
         )
 
     def close(self) -> None:
-        self.cap.release()
-        if self.show_debug:
-            cv2.destroyAllWindows()
         self.landmarker.close()
