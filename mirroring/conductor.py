@@ -65,6 +65,17 @@ from mediapipe_pose_osc_protocol import (
 )
 from pose_solver import BoneTransform, PoseSolver
 from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder
+
+# Tasks-API drawing helpers. The legacy mp.solutions namespace (and
+# mediapipe.framework.formats.landmark_pb2 with it) no longer exists in current
+# mediapipe builds - the Tasks drawing_utils takes the raw landmark list
+# natively, so no protobuf conversion is needed.
+from mediapipe.tasks.python.vision import (
+    drawing_utils,
+    drawing_styles,
+    PoseLandmarksConnections,
+    FaceLandmarksConnections,
+)
  
 LIVE_LINK_FACE_PORT = 11111  # Unreal's stock Live Link Face plugin default
 POSE_OSC_PORT = 9001         # arbitrary - must match whatever the custom LiveLink Source ends up listening on
@@ -77,6 +88,43 @@ _UNRESOLVED_EYE_CHANNELS = (
     "leftEyeYaw", "leftEyePitch", "leftEyeRoll",
     "rightEyeYaw", "rightEyePitch", "rightEyeRoll",
 )
+
+# Candidate capture modes, highest first. Cameras silently fall back to their
+# nearest supported mode instead of failing, so the only way to know what you
+# actually got is to set it and read it back - which is what the loop does.
+_PREFERRED_MODES = ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720))
+
+
+def open_camera(index: int, width: int | None = None, height: int | None = None):
+    """Opens the shared webcam at the highest mode it will actually accept.
+
+    MJPG matters more than it looks: many webcams will agree to 1080p+ over the
+    default YUY2 but then deliver it at 5-10 fps, which reads as "the tracking is
+    laggy" rather than "the camera is starved".
+    """
+    backend = cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else cv2.CAP_ANY
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened():  # some backends dislike the explicit flag
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {index}")
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    modes = [(width, height)] if width and height else list(_PREFERRED_MODES)
+    for w, h in modes:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        if (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))) == (w, h):
+            break
+    cap.set(cv2.CAP_PROP_FPS, 60)
+
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    got_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Camera {index}: {got_w}x{got_h} @ {got_fps:.0f} fps (MJPG)")
+    return cap
+
 
 class Smoother:
     """Simple per-channel exponential moving average filter.
@@ -164,11 +212,17 @@ class PoseSmoother:
         return smoothed_bones
 
 class Conductor:
+    DEBUG_WINDOW = "Conductor Debug"
+
     def __init__(
         self,
         face_capture: MediaPipeFaceCapture,
         pose_capture: MediaPipePoseCapture,
         camera_index: int = 0,
+        camera_width: int | None = None,
+        camera_height: int | None = None,
+        torso_lean_offset_deg: float = 0.0,
+        preview_scale: float = 0.5,
         face_ip: str = "127.0.0.1",
         face_port: int = LIVE_LINK_FACE_PORT,
         pose_ip: str = "127.0.0.1",
@@ -180,12 +234,25 @@ class Conductor:
         self.face_capture = face_capture
         self.pose_capture = pose_capture
         self.show_debug = show_debug
+        self._warned_no_pose_lms = False
+        self._warned_no_face_lms = False
         self._start_time = time.perf_counter()
  
         # --- the one shared camera, opened exactly once ---
-        self.cap = cv2.VideoCapture(camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open camera index {camera_index}")
+        self.cap = open_camera(camera_index, camera_width, camera_height)
+
+        # The capture frame is deliberately large (MediaPipe crops its ROI from it,
+        # so resolution helps detection at distance), but a 4K debug window is
+        # unusable. WINDOW_NORMAL makes it user-resizable; the initial size is just
+        # a fraction of the capture so it fits on screen. This scales the WINDOW
+        # only - the full-resolution frame still goes to the detectors.
+        if self.show_debug:
+            cap_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cv2.namedWindow(self.DEBUG_WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+            cv2.resizeWindow(self.DEBUG_WINDOW,
+                             max(320, int(cap_w * preview_scale)),
+                             max(180, int(cap_h * preview_scale)))
  
         # --- face channel: transform state + network target ---
         self.face_smoother = Smoother(alpha=face_smoothing_alpha)
@@ -208,9 +275,11 @@ class Conductor:
         self.pose_smoother = PoseSmoother(alpha=pose_smoothing_alpha)
 
         # --- pose channel: transform state + network target ---
-        self.pose_solver = PoseSolver()
+        self.pose_solver = PoseSolver(torso_lean_offset_deg=torso_lean_offset_deg)
         self.pose_encoder = LiveLinkPoseOSCEncoder(ip=pose_ip, port=pose_port)
         self._last_valid_bone_transforms: list[BoneTransform] = []
+        # Kept so the 'c' key can calibrate the torso lean from the live frame.
+        self._last_valid_world_landmarks: list = []
  
     # ---- timing ---------------------------------------------------------
  
@@ -275,6 +344,7 @@ class Conductor:
             # Get raw solved bones from MediaPipe
             raw_bones = self.pose_solver.solve(frame.world_landmarks)
             self._last_valid_bone_transforms = raw_bones
+            self._last_valid_world_landmarks = frame.world_landmarks
 
             # Apply quaternion-safe smoothing
             smoothed_bones = self.pose_smoother.apply(raw_bones)
@@ -302,21 +372,88 @@ class Conductor:
  
     # ---- debug overlay -----------------------------------------------------
  
-    def _draw_debug(self, frame, face_frame: FaceFrame, pose_frame: PoseFrame) -> None:
-        """Lightweight status overlay - a single combined window showing
-        whether each channel is currently tracking, not a full landmark
-        mesh/skeleton drawing. Kept deliberately simple here to keep this
-        merge focused; the full mesh overlay (mp.solutions.drawing_utils,
-        with the landmark_pb2 conversion covered in earlier review) can
-        be added back per-channel if wanted."""
+    @staticmethod
+    def _image_landmarks(frame) -> list | None:
+        """Finds the IMAGE-SPACE landmarks on a Face/PoseFrame.
+
+        Deliberately not frame.world_landmarks: those are metric and hip-centred,
+        so drawing them over the picture would put a skeleton in the corner.
+
+        The Tasks API returns one landmark list PER DETECTED PERSON/FACE, i.e.
+        result.pose_landmarks is a list of lists. If the frame stored that outer
+        list verbatim, unwrap the first entry; if it already stored [0], use it
+        as-is. Field naming is up to the capture modules, so try the plausible
+        names and give up quietly rather than killing the loop.
+        """
+        for attr in ("landmarks", "image_landmarks", "normalized_landmarks",
+                     "pose_landmarks", "face_landmarks"):
+            value = getattr(frame, attr, None)
+            if not value:
+                continue
+            first = value[0]
+            # a list-of-lists means it is still per-person; unwrap it
+            if isinstance(first, (list, tuple)):
+                return list(first) if first else None
+            return list(value)
+        return None
+
+    def _draw_debug(self, frame, face_frame: FaceFrame, pose_frame: PoseFrame) -> int:
+        """Combined webcam view: tracking status plus the full landmark overlay
+        for both channels. Returns the key pressed, so the caller can act on it."""
+        pose_lms = self._image_landmarks(pose_frame) if pose_frame.valid else None
+        if pose_lms:
+            drawing_utils.draw_landmarks(
+                image=frame,
+                landmark_list=pose_lms,
+                connections=PoseLandmarksConnections.POSE_LANDMARKS,
+                landmark_drawing_spec=drawing_styles.get_default_pose_landmarks_style(),
+                connection_drawing_spec=drawing_utils.DrawingSpec(color=(0, 255, 0), thickness=2),
+            )
+        elif pose_frame.valid and not self._warned_no_pose_lms:
+            print("[debug] PoseFrame exposes no image-space landmarks - skeleton overlay "
+                  "disabled. Expose the Tasks API's result.pose_landmarks on PoseFrame "
+                  "(alongside world_landmarks) to enable it.")
+            self._warned_no_pose_lms = True
+
+        face_lms = self._image_landmarks(face_frame) if face_frame.valid else None
+        if face_lms:
+            drawing_utils.draw_landmarks(
+                image=frame, landmark_list=face_lms,
+                connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=drawing_styles.get_default_face_mesh_tesselation_style())
+            drawing_utils.draw_landmarks(
+                image=frame, landmark_list=face_lms,
+                connections=FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=drawing_styles.get_default_face_mesh_contours_style())
+        elif face_frame.valid and not self._warned_no_face_lms:
+            print("[debug] FaceFrame exposes no image-space landmarks - mesh overlay "
+                  "disabled. Expose the Tasks API's result.face_landmarks on FaceFrame.")
+            self._warned_no_face_lms = True
+
+        # Text drawn in pixels on a 4K frame would be unreadable once the window is
+        # scaled down, so scale it with the frame height.
+        s = max(0.7, frame.shape[0] / 1080.0)
+        t = max(2, int(round(2 * s)))
         face_status = "FACE: TRACKING" if face_frame.valid else "FACE: SEARCHING"
         pose_status = "POSE: TRACKING" if pose_frame.valid else "POSE: SEARCHING"
         face_color = (0, 255, 0) if face_frame.valid else (0, 0, 255)
         pose_color = (0, 255, 0) if pose_frame.valid else (0, 0, 255)
-        cv2.putText(frame, face_status, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, face_color, 2)
-        cv2.putText(frame, pose_status, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, pose_color, 2)
-        cv2.imshow("Conductor Debug", frame)
-        cv2.waitKey(1)
+        cv2.putText(frame, face_status, (int(20*s), int(34*s)), cv2.FONT_HERSHEY_SIMPLEX, 0.7*s, face_color, t)
+        cv2.putText(frame, pose_status, (int(20*s), int(68*s)), cv2.FONT_HERSHEY_SIMPLEX, 0.7*s, pose_color, t)
+
+        # MediaPipe reports a standing performer as leaning ~18 deg forward; this
+        # shows the offset currently cancelling that, and how to set it.
+        lean_now = (self.pose_solver.measure_torso_lean_deg(self._last_valid_world_landmarks)
+                    if self._last_valid_world_landmarks else 0.0)
+        cv2.putText(frame,
+                    f"lean raw {lean_now:+5.1f}  offset {self.pose_solver.torso_lean_offset_deg:+5.1f}"
+                    f"  [c] calibrate upright",
+                    (int(20*s), int(100*s)), cv2.FONT_HERSHEY_SIMPLEX, 0.6*s, (255, 200, 0), t)
+
+        cv2.imshow(self.DEBUG_WINDOW, frame)
+        return cv2.waitKey(1) & 0xFF
  
     # ---- main loop ---------------------------------------------------------
  
@@ -346,7 +483,12 @@ class Conductor:
                 self._handle_pose(pose_frame, ts)
  
                 if self.show_debug:
-                    self._draw_debug(raw_frame, face_frame, pose_frame)
+                    key = self._draw_debug(raw_frame, face_frame, pose_frame)
+                    if key == ord("c") and self._last_valid_world_landmarks:
+                        offset = self.pose_solver.calibrate_neutral(self._last_valid_world_landmarks)
+                        print(f"Torso lean calibrated: offset {offset:+.1f} deg")
+                    elif key == 27:  # Esc
+                        break
         except KeyboardInterrupt:
             pass
         finally:
@@ -362,6 +504,17 @@ def main() -> None:
     parser.add_argument("--face-model", default="face_landmarker.task")
     parser.add_argument("--pose-model", default="pose_landmarker_full.task")
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--width", type=int, default=None,
+                         help="force a capture width; default picks the highest mode the camera accepts")
+    parser.add_argument("--height", type=int, default=None,
+                         help="force a capture height; use together with --width")
+    parser.add_argument("--preview-scale", type=float, default=0.5,
+                         help="initial debug window size as a fraction of the capture "
+                              "resolution. The window is resizable regardless.")
+    parser.add_argument("--torso-lean-offset", type=float, default=0.0,
+                         help="degrees of forward lean to cancel out. MediaPipe reports a "
+                              "vertical performer as leaning ~18 deg forward; press 'c' in the "
+                              "debug window while standing upright to measure it, then pass it here.")
     parser.add_argument("--face-ip", default="127.0.0.1")
     parser.add_argument("--face-port", type=int, default=LIVE_LINK_FACE_PORT)
     parser.add_argument("--pose-ip", default="127.0.0.1")
@@ -387,6 +540,9 @@ def main() -> None:
     conductor = Conductor(
         face_capture, pose_capture,
         camera_index=args.camera,
+        camera_width=args.width, camera_height=args.height,
+        torso_lean_offset_deg=args.torso_lean_offset,
+        preview_scale=args.preview_scale,
         face_ip=args.face_ip, face_port=args.face_port,
         pose_ip=args.pose_ip, pose_port=args.pose_port,
         face_smoothing_alpha=args.face_smoothing,
