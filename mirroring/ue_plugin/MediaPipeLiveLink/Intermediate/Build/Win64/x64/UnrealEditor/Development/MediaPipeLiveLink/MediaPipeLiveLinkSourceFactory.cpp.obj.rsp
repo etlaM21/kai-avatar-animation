@@ -1,0 +1,14 @@
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Source/MediaPipeLiveLink/Private/MediaPipeLiveLinkSourceFactory.cpp"
+@"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLink.Shared.rsp"
+/FI"K:/KaiTracking/Intermediate/Build/Win64/x64/KaiTrackingEditor/Development/UnrealEd/SharedPCH.UnrealEd.Project.ValApi.ValExpApi.Cpp20.InclOrderUnreal5_6.h"
+/FI"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/Definitions.MediaPipeLiveLink.h"
+/Yu"K:/KaiTracking/Intermediate/Build/Win64/x64/KaiTrackingEditor/Development/UnrealEd/SharedPCH.UnrealEd.Project.ValApi.ValExpApi.Cpp20.InclOrderUnreal5_6.h"
+/Fp"K:/KaiTracking/Intermediate/Build/Win64/x64/KaiTrackingEditor/Development/UnrealEd/SharedPCH.UnrealEd.Project.ValApi.ValExpApi.Cpp20.InclOrderUnreal5_6.h.pch"
+/Fo"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLinkSourceFactory.cpp.obj"
+/experimental:log "K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLinkSourceFactory.cpp.sarif"
+/sourceDependencies "K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLinkSourceFactory.cpp.dep.json"
+/nologo
+/TP
+/GR-
+/std:c++20
+/wd5054

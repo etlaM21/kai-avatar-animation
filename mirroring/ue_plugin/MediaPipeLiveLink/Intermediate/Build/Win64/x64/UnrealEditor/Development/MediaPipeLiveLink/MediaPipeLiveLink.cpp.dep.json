@@ -1,0 +1,14 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "k:\\kaitracking\\plugins\\mediapipelivelink\\source\\mediapipelivelink\\private\\mediapipelivelink.cpp",
+        "ProvidedModule": "",
+        "PCH": "k:\\kaitracking\\intermediate\\build\\win64\\x64\\kaitrackingeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.valexpapi.cpp20.inclorderunreal5_6.h.pch",
+        "Includes": [
+            "k:\\kaitracking\\plugins\\mediapipelivelink\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\mediapipelivelink\\definitions.mediapipelivelink.h",
+            "k:\\kaitracking\\plugins\\mediapipelivelink\\source\\mediapipelivelink\\public\\mediapipelivelink.h"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}

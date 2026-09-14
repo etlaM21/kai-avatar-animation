@@ -1,0 +1,13 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.MediaPipeLiveLink.cpp.obj": [
+			"MediaPipeLiveLink.init.gen.cpp.obj",
+			"MediaPipeLiveLinkSourceFactory.gen.cpp.obj",
+			"PerModuleInline.gen.cpp.obj",
+			"MediaPipeLiveLink.cpp.obj",
+			"MediaPipeLiveLinkSource.cpp.obj",
+			"MediaPipeLiveLinkSourceFactory.cpp.obj"
+		]
+	}
+}

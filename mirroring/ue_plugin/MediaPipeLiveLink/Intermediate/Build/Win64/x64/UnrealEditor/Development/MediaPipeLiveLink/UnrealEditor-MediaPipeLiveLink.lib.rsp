@@ -1,0 +1,16 @@
+/NOLOGO
+/errorReport:prompt
+/MACHINE:x64
+/SUBSYSTEM:WINDOWS
+/experimental:deterministic
+/DEF
+/NAME:"UnrealEditor-MediaPipeLiveLink.dll"
+/IGNORE:4221
+/NODEFAULTLIB
+"K:/KaiTracking/Intermediate/Build/Win64/x64/KaiTrackingEditor/Development/UnrealEd/SharedPCH.UnrealEd.Project.ValApi.ValExpApi.Cpp20.InclOrderUnreal5_6.h.obj"
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/Module.MediaPipeLiveLink.cpp.obj"
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLink.cpp.obj"
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLinkSourceFactory.cpp.obj"
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/MediaPipeLiveLinkSource.cpp.obj"
+"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/DumpRefSkeleton.cpp.obj"
+/OUT:"K:/KaiTracking/Plugins/MediaPipeLiveLink/Intermediate/Build/Win64/x64/UnrealEditor/Development/MediaPipeLiveLink/UnrealEditor-MediaPipeLiveLink.lib"
