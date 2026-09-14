@@ -45,6 +45,7 @@ class FaceFrame:
     timestamp_ms: int
     # ARKit blendshape name -> score. 52 entries when valid, empty otherwise.
     blendshapes: dict[str, float] = field(default_factory=dict)
+    landmarks: list = field(default_factory=list)
     head_yaw_deg: float = 0.0
     head_pitch_deg: float = 0.0
     head_roll_deg: float = 0.0
@@ -129,6 +130,7 @@ class MediaPipeFaceCapture:
             return FaceFrame(valid=False, timestamp_ms=timestamp_ms)
 
         blendshapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
+        landmarks = result.face_landmarks[0] if result.face_landmarks else [],
 
         yaw = pitch = roll = 0.0
         if result.facial_transformation_matrixes:
@@ -139,6 +141,7 @@ class MediaPipeFaceCapture:
             valid=True,
             timestamp_ms=timestamp_ms,
             blendshapes=blendshapes,
+            landmarks=landmarks,
             head_yaw_deg=yaw,
             head_pitch_deg=pitch,
             head_roll_deg=roll,
