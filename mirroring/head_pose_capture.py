@@ -83,7 +83,13 @@ class HeadPoseCapture:
     per frame, same async-dispatch-then-read-latest pattern as
     MediaPipeHolisticCapture."""
 
-    def __init__(self, model_path: str = "face_landmarker.task") -> None:
+    def __init__(
+        self,
+        model_path: str = "face_landmarker.task",
+        min_face_detection_confidence: float = 0.5,
+        min_face_presence_confidence: float = 0.5,
+        min_tracking_confidence: float = 0.5,
+    ) -> None:
         # A lock is required because detect_async() runs the model on a
         # MediaPipe-internal worker thread; _on_result() below fires on
         # that thread, while process() reads the result from whichever
@@ -99,9 +105,9 @@ class HeadPoseCapture:
             # the transformation matrix is unique to this detector.
             output_face_blendshapes=False,
             output_facial_transformation_matrixes=True,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_face_detection_confidence=min_face_detection_confidence,
+            min_face_presence_confidence=min_face_presence_confidence,
+            min_tracking_confidence=min_tracking_confidence,
             result_callback=self._on_result,
         )
         self.landmarker = FaceLandmarker.create_from_options(options)

@@ -87,6 +87,51 @@ Needs `holistic_landmarker.task` and `face_landmarker.task` next to
 nothing loads it any more. In the debug window, press `c` while standing
 upright to calibrate away MediaPipe's ~18° forward-lean bias, `Esc` to quit.
 
+Or drive the same pipeline from a GUI instead of the terminal:
+
+```powershell
+.\venv\Scripts\python.exe gui.py
+```
+
+### GUI control surface (`gui.py`)
+
+A single-window Tkinter wrapper around `Conductor` - it does not reimplement
+any tracking/smoothing/solving logic, only drives an unmodified instance.
+`conductor.py`, `pose_solver.py` and the `mediapipe_*_capture.py` modules
+keep working unchanged from the command line exactly as before.
+
+- **Live pane** shows the same annotated frame `conductor.py`'s own debug
+  window would, letterboxed to the pane, with a rolling FPS readout next to
+  the run status (measured in the wrapper from frames actually received, not
+  from inside `Conductor`).
+- **Live controls** (applied by assigning straight onto the running
+  `Conductor`, no restart): face smoothing alpha, pose smoothing alpha (this
+  one also smooths both hands - `PoseSmoother` merges body + fingers into one
+  call, there is no separate hand-alpha), torso lean offset, and a
+  "Calibrate upright" button (`pose_solver.calibrate_neutral()`, same as
+  pressing `c` in the plain debug window).
+  Debug-overlay and FPS-display are GUI-only toggles.
+- **Restart-required controls**, grouped under a collapsible, scrollable
+  **Advanced** section (collapsed by default): camera index/resolution,
+  model paths, face/pose target IP:port, and per-detector confidence
+  thresholds. Changing any of these while running marks the panel dirty and
+  enables **Apply & Restart** instead of silently doing nothing.
+- **How it gets frames out and stops cleanly**, since `Conductor` owns the
+  camera and calls `cv2.imshow`/`cv2.waitKey` itself: `gui.py` monkeypatches
+  the shared `cv2` module (`imshow` → push onto a `maxsize=1` queue,
+  drop-when-full; `waitKey` → returns Esc once a `threading.Event` is set,
+  reusing `Conductor.run()`'s own existing exit path instead of inventing a
+  new one; `namedWindow`/`resizeWindow` → no-ops) before ever constructing a
+  `Conductor`, and runs `Conductor.run()` on a daemon thread, joined with a
+  timeout on Stop/restart/window-close so the camera is never left held by
+  an orphaned thread.
+- Confidence thresholds needed one small, disclosed, additive exception to
+  "don't modify existing files": `mediapipe_holistic_capture.py` and
+  `head_pose_capture.py` gained optional constructor kwargs for the
+  thresholds that were previously hardcoded at `0.5`, all still defaulting
+  to `0.5` - `--holistic-model`/`--head-pose-model` CLI runs are unaffected.
+- Needs `Pillow` (`PIL.ImageTk`), added to `requirements.txt`.
+
 ### Orphaned files, kept but not live
 
 - `mediapipe_pose_osc_protocol.py` - imported by `conductor.py` but only
@@ -211,6 +256,10 @@ retargeting). Taking it further to a MetaHuman is still just a plan:
   module, dynamic bone count, multi-subject-ready, driving Manny live.
 - **Debug overlay** - full pose/face-mesh/hand landmark drawing, tracking
   status per channel, live torso-lean readout + one-key calibration.
+- **GUI control surface** (`gui.py`, §2) - Tkinter wrapper driving an
+  unmodified `Conductor`: live smoothing/calibration controls, a scrollable
+  restart-required Advanced section, and clean Start/Stop with no orphaned
+  camera handles.
 
 ## 9. Open items / next steps
 

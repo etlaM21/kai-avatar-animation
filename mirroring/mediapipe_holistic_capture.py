@@ -92,7 +92,15 @@ class MediaPipeHolisticCapture:
     """Wraps HolisticLandmarker. Owns no camera - call process() once per
     frame."""
 
-    def __init__(self, model_path: str = "holistic_landmarker.task") -> None:
+    def __init__(
+        self,
+        model_path: str = "holistic_landmarker.task",
+        min_face_detection_confidence: float = 0.5,
+        min_face_landmarks_confidence: float = 0.5,
+        min_pose_detection_confidence: float = 0.5,
+        min_pose_landmarks_confidence: float = 0.5,
+        min_hand_landmarks_confidence: float = 0.5,
+    ) -> None:
         # Same lock rationale as head_pose_capture.HeadPoseCapture:
         # detect_async() fires _on_result() on a MediaPipe worker thread,
         # process() reads it from Conductor's main-loop thread.
@@ -104,11 +112,11 @@ class MediaPipeHolisticCapture:
             running_mode=RunningMode.LIVE_STREAM,
             output_face_blendshapes=True,
             output_segmentation_mask=False,
-            min_face_detection_confidence=0.5,
-            min_face_landmarks_confidence=0.5,
-            min_pose_detection_confidence=0.5,
-            min_pose_landmarks_confidence=0.5,
-            min_hand_landmarks_confidence=0.5,
+            min_face_detection_confidence=min_face_detection_confidence,
+            min_face_landmarks_confidence=min_face_landmarks_confidence,
+            min_pose_detection_confidence=min_pose_detection_confidence,
+            min_pose_landmarks_confidence=min_pose_landmarks_confidence,
+            min_hand_landmarks_confidence=min_hand_landmarks_confidence,
             result_callback=self._on_result,
         )
         self.landmarker = HolisticLandmarker.create_from_options(options)

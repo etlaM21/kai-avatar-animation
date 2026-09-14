@@ -116,3 +116,118 @@ joint (metacarpals alone carry a few degrees — see above, not a regression).
 - Comments explain *why*, especially where a non-obvious convention is load-bearing.
 - Prefer measuring over guessing: when a pose looks wrong, compute the error against
   ground truth before changing any math.
+
+## gui.py — Tkinter control surface
+
+A single-window control surface for the mocap pipeline. It is a **wrapper**:
+`gui.py` is the only new file, and it drives the existing pipeline rather than
+reimplementing any of it.
+
+### Hard constraint: do not modify the existing scripts
+
+`conductor.py`, `pose_solver.py`, `mediapipe_*_capture.py` and the protocol modules
+must keep working unchanged when run from the command line exactly as they do today.
+`python conductor.py --debug --camera 1` must behave identically after this feature
+lands.
+
+The one permitted exception, if and only if the wrapper approach below proves
+unworkable: add an **optional** `frame_sink: Callable[[np.ndarray], None] | None = None`
+parameter to `Conductor.__init__`, called with the annotated frame in `_draw_debug`.
+It must default to `None` and preserve current behaviour exactly when unset. Propose
+this before doing it — do not change existing files silently.
+
+### Getting frames out of the conductor
+
+`Conductor` owns the camera and calls `cv2.imshow` itself, so the wrapper has to
+intercept. Preferred approach, which touches no project file:
+
+- Before constructing `Conductor`, monkeypatch in the `gui` module: `cv2.imshow` to
+  push the frame onto a `queue.Queue(maxsize=1)` instead of opening a window;
+  `cv2.waitKey` to return `-1`; `cv2.namedWindow` / `cv2.resizeWindow` to no-ops.
+- Construct `Conductor(show_debug=True, ...)` ALWAYS. If `show_debug` is `False` the
+  conductor never produces an annotated frame and the video pane goes black — the UI's
+  debug toggle must therefore be implemented some other way (see below), not by
+  flipping `show_debug`.
+
+Use a `maxsize=1` queue and drop frames when full. The GUI must never apply
+backpressure to the capture loop; a laggy UI must not become laggy tracking.
+
+### Threading
+
+`Conductor.run()` blocks. Run it on a `threading.Thread(daemon=True)`. Tkinter is not
+thread-safe: **all** widget updates happen on the main thread via `root.after(...)`
+polling the frame queue. Never touch a widget from the pipeline thread.
+
+Stopping: `Conductor.run()` loops until its own exit condition. Signal it with a
+`threading.Event` the wrapper checks, or set the flag the conductor already uses —
+whichever exists. Always `join()` with a timeout before restarting, or you leak camera
+handles and the next start fails with a device-busy error.
+
+### Live vs restart-required parameters
+
+This split is the core of the design. Get it right before building widgets.
+
+**Live** — adjustable while running, by assigning to the live object's attributes:
+- face / pose / hand smoothing factors (the `Smoother` alpha values)
+- torso lean offset (`pose_solver.torso_lean_offset_deg`), plus a "Calibrate upright"
+  button calling `pose_solver.calibrate_neutral(...)`
+- debug overlay toggle, FPS display toggle
+
+**Restart-required** — baked in when the MediaPipe task or camera is constructed:
+- camera index, capture width/height
+- every detection/tracking/presence confidence threshold
+- OSC and UDP ports, target IPs
+- model selection (lite/full/heavy)
+
+Restart-required controls must visibly indicate that they need a restart. Either
+disable them while running, or mark them dirty and enable an "Apply & Restart" button.
+Do not silently accept a change that has no effect — that is the single most confusing
+failure mode for this kind of panel.
+
+### Debug overlay toggle
+
+Since `show_debug` must stay `True`, implement the toggle by monkeypatching
+`mediapipe.tasks.python.vision.drawing_utils.draw_landmarks` to a no-op while the
+toggle is off. Leave the status text (`cv2.putText`) alone — it is cheap and useful.
+Note in a comment that skeleton drawing on a 4K frame is genuinely expensive, so this
+toggle is a real performance control, not just cosmetic.
+
+### FPS counter
+
+Measured in the wrapper from frames arriving on the queue, not from anything inside the
+conductor. Show a rolling average over ~30 frames, not the instantaneous value.
+Draw it into the video pane when the debug toggle is on.
+
+### Layout
+
+- Window height **max 720 px**. Resizable. Set a sensible `minsize`.
+- Roughly half the window is the webcam view. Preserve the capture aspect ratio when
+  scaling (letterbox rather than stretch); a distorted preview makes the tracking look
+  broken when it is not.
+- Controls in the other half, grouped: Camera · Smoothing · Calibration · Advanced.
+- **Advanced** is a collapsible section, collapsed by default, holding ports, IPs,
+  thresholds and model selection. A plain expand/collapse toggle is fine.
+
+### Styling
+
+Dark, technical, no icons or decoration. Flat colours, one accent for active state,
+monospace for numeric readouts. `ttk` does not honour background colours on all
+platforms with the default theme — use `ttk.Style().theme_use("clam")` as the base
+before restyling, or plain `tk` widgets where `ttk` fights you. Define the palette as
+module-level constants; do not scatter hex codes through the layout code.
+
+### Dependencies
+
+Displaying an OpenCV frame in Tkinter needs `Pillow` (`PIL.ImageTk`). Add it to the
+project's requirements. Convert BGR→RGB before handing the frame to PIL, or the preview
+comes out blue.
+
+### Acceptance checks
+
+1. `python conductor.py --debug --camera 1` still works, unchanged.
+2. Changing a smoothing slider visibly changes responsiveness without a restart.
+3. Changing the camera index and restarting picks up the new camera, with no
+   device-busy error on the old one.
+4. Toggling the debug overlay off measurably raises the FPS counter at 4K.
+5. Closing the window terminates the pipeline thread and releases the camera — no
+   orphaned `python.exe`.
