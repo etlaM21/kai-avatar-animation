@@ -28,7 +28,10 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import math
+from mediapipe.tasks.python.vision import hand_landmarker
 from mediapipe_pose_capture import PoseLandmark
+
+HandLandmark = hand_landmarker.HandLandmark
 
 BONE_NAMES: list[str] = [
     "pelvis", "spine_01", "spine_02", "spine_04", "neck_01", "head",
@@ -229,6 +232,125 @@ TORSO_BONES = {"pelvis", "spine_01", "spine_02", "spine_04", "neck_01", "head"}
 INTERNAL_BONES = {"spine_03", "spine_05", "neck_02"}
 
 
+# ---------------------------------------------------------------------------
+# Finger rig, extending the chain above past hand_l/hand_r. Same technique
+# (minimal swing from rest direction to measured direction, parent-local
+# conversion), same rig-verification discipline: VERIFIED against a
+# RefSkeleton dump of SKM_Manny_Simple, do not hand-edit. Each hand has 19
+# real bones - a metacarpal + 3 phalanges for index/middle/ring/pinky, and
+# just 3 phalanges (no metacarpal) for the thumb - and MediaPipe's 21-point
+# hand topology maps onto that directly, one landmark-pair per bone.
+#
+# Unlike the body chain, there's no unstreamed-bone gap to model here:
+# hand_l/hand_r parent every finger bone directly, no equivalent of
+# spine_03/05/neck_02 in between.
+#
+# (name, parent, rotator (pitch, yaw, roll), offset (x, y, z)). parent is
+# either "hand_l"/"hand_r" (already in BONE_NAMES/FULL_CHAIN above) or
+# another finger bone earlier in this same list.
+# ---------------------------------------------------------------------------
+
+FINGER_CHAIN_L: list[tuple] = [
+    ("thumb_01_l", "hand_l", (-39.904178, -20.508676, 73.564464), (1.9924, -1.3566, -2.5815)),
+    ("thumb_02_l", "thumb_01_l", (1.932290, -23.246006, 3.530628), (4.3780, 0.0, 0.0)),
+    ("thumb_03_l", "thumb_02_l", (0.0, -10.000000, 0.0), (3.0860, 0.0, 0.0)),
+
+    ("index_metacarpal_l", "hand_l", (-7.325502, 0.606162, 3.287746), (3.4445, 0.3847, -2.3793)),
+    ("index_01_l", "index_metacarpal_l", (0.0, -23.373000, 0.0), (5.8771, -0.0432, 0.2409)),
+    ("index_02_l", "index_01_l", (0.0, -14.892568, 0.0), (4.0800, 0.0, 0.0)),
+    ("index_03_l", "index_02_l", (0.0, -12.516401, 0.0), (2.5950, 0.0, 0.0)),
+
+    ("middle_metacarpal_l", "hand_l", (0.130751, 2.318392, -4.272500), (3.3758, 0.7536, -0.1829)),
+    ("middle_01_l", "middle_metacarpal_l", (0.0, -31.572682, 0.0), (6.0982, 0.0, 0.0)),
+    ("middle_02_l", "middle_01_l", (0.0, -20.769210, 0.0), (5.1690, 0.0, 0.0)),
+    ("middle_03_l", "middle_02_l", (0.0, -10.000000, 0.0), (2.4740, 0.0, 0.0)),
+
+    ("ring_metacarpal_l", "hand_l", (11.809319, 1.594563, -13.299835), (3.3743, 0.5425, 1.0918)),
+    ("ring_01_l", "ring_metacarpal_l", (0.116938, -29.414482, 6.395844), (5.6455, 0.0416, -0.0207)),
+    ("ring_02_l", "ring_01_l", (0.0, -18.964000, 0.0), (4.9770, 0.0, 0.0)),
+    ("ring_03_l", "ring_02_l", (0.0, -9.168000, 0.0), (2.2650, 0.0, 0.0)),
+
+    ("pinky_metacarpal_l", "hand_l", (19.527703, -11.850627, -27.769049), (3.3144, 0.3059, 2.3911)),
+    ("pinky_01_l", "pinky_metacarpal_l", (-0.605043, -14.833681, 10.491640), (4.9576, 0.1431, -0.1988)),
+    ("pinky_02_l", "pinky_01_l", (0.0, -21.286999, 0.0), (3.8160, 0.0, 0.0)),
+    ("pinky_03_l", "pinky_02_l", (0.0, -4.917000, 0.0), (2.0400, 0.0, 0.0)),
+]
+
+FINGER_CHAIN_R: list[tuple] = [
+    ("thumb_01_r", "hand_r", (-39.904178, -20.508676, 73.564464), (-1.9928, 1.3567, 2.5813)),
+    ("thumb_02_r", "thumb_01_r", (1.932290, -23.246006, 3.530628), (-4.3778, 0.0, 0.0)),
+    ("thumb_03_r", "thumb_02_r", (0.0, -10.000000, 0.0), (-3.0860, 0.0, 0.0)),
+
+    ("index_metacarpal_r", "hand_r", (-7.325502, 0.606162, 3.287746), (-3.4445, -0.3852, 2.3793)),
+    ("index_01_r", "index_metacarpal_r", (0.0, -23.373000, 0.0), (-5.8772, 0.0434, -0.2410)),
+    ("index_02_r", "index_01_r", (0.0, -14.892568, 0.0), (-4.0799, 0.0, 0.0)),
+    ("index_03_r", "index_02_r", (0.0, -12.516401, 0.0), (-2.5951, 0.0, 0.0)),
+
+    ("middle_metacarpal_r", "hand_r", (0.130751, 2.318392, -4.272500), (-3.3758, -0.7540, 0.1828)),
+    ("middle_01_r", "middle_metacarpal_r", (0.0, -31.572682, 0.0), (-6.0984, 0.0001, 0.0)),
+    ("middle_02_r", "middle_01_r", (0.0, -20.769210, 0.0), (-5.1690, 0.0001, 0.0)),
+    ("middle_03_r", "middle_02_r", (0.0, -10.000000, 0.0), (-2.4740, 0.0, 0.0)),
+
+    ("ring_metacarpal_r", "hand_r", (11.809319, 1.594563, -13.299835), (-3.3742, -0.5430, -1.0918)),
+    ("ring_01_r", "ring_metacarpal_r", (0.116938, -29.414482, 6.395844), (-5.6457, -0.0414, 0.0207)),
+    ("ring_02_r", "ring_01_r", (0.0, -18.964000, 0.0), (-4.9771, 0.0, 0.0)),
+    ("ring_03_r", "ring_02_r", (0.0, -9.168000, 0.0), (-2.2650, -0.0001, 0.0)),
+
+    ("pinky_metacarpal_r", "hand_r", (19.527703, -11.850627, -27.769049), (-3.3147, -0.3059, -2.3913)),
+    ("pinky_01_r", "pinky_metacarpal_r", (-0.605043, -14.833681, 10.491640), (-4.9573, -0.1433, 0.1989)),
+    ("pinky_02_r", "pinky_01_r", (0.0, -21.286999, 0.0), (-3.8160, 0.0, 0.0)),
+    ("pinky_03_r", "pinky_02_r", (0.0, -4.917000, 0.0), (-2.0400, 0.0, 0.0)),
+]
+
+FINGER_CHAIN: list[tuple] = FINGER_CHAIN_L + FINGER_CHAIN_R
+FINGER_BONE_NAMES: list[str] = [c[0] for c in FINGER_CHAIN]
+
+# Which pair of MediaPipe hand landmarks aims each bone. A finger's metacarpal
+# (or, for the thumb, which has none in Manny, thumb_01 taking that role) aims
+# WRIST -> its own MCP-equivalent; each phalanx then aims through the next
+# joint out - exactly mirroring BONE_AIM's one-pair-per-bone shape above.
+#
+# Known, accepted approximation: each metacarpal's REST direction runs from
+# its own rest position (offset a little from the wrist for where that
+# specific finger meets the palm) to its child's, but its aim is measured
+# WRIST -> MCP - MediaPipe has no landmark at that per-finger palm offset,
+# only one shared WRIST point. Confirmed (via this module's finger tests)
+# to cost a few degrees on metacarpals alone; every phalanx joint - the ones
+# that actually drive curl and splay - solves to 0.000 deg in the bind-pose
+# round-trip test. Not fixable without estimating the missing offset from
+# something other than measurement, i.e. guessing again.
+_HL = HandLandmark
+FINGER_AIM_L: dict[str, tuple] = {
+    "thumb_01_l": (_HL.WRIST, _HL.THUMB_CMC),
+    "thumb_02_l": (_HL.THUMB_CMC, _HL.THUMB_MCP),
+    "thumb_03_l": (_HL.THUMB_MCP, _HL.THUMB_IP),
+
+    "index_metacarpal_l": (_HL.WRIST, _HL.INDEX_FINGER_MCP),
+    "index_01_l": (_HL.INDEX_FINGER_MCP, _HL.INDEX_FINGER_PIP),
+    "index_02_l": (_HL.INDEX_FINGER_PIP, _HL.INDEX_FINGER_DIP),
+    "index_03_l": (_HL.INDEX_FINGER_DIP, _HL.INDEX_FINGER_TIP),
+
+    "middle_metacarpal_l": (_HL.WRIST, _HL.MIDDLE_FINGER_MCP),
+    "middle_01_l": (_HL.MIDDLE_FINGER_MCP, _HL.MIDDLE_FINGER_PIP),
+    "middle_02_l": (_HL.MIDDLE_FINGER_PIP, _HL.MIDDLE_FINGER_DIP),
+    "middle_03_l": (_HL.MIDDLE_FINGER_DIP, _HL.MIDDLE_FINGER_TIP),
+
+    "ring_metacarpal_l": (_HL.WRIST, _HL.RING_FINGER_MCP),
+    "ring_01_l": (_HL.RING_FINGER_MCP, _HL.RING_FINGER_PIP),
+    "ring_02_l": (_HL.RING_FINGER_PIP, _HL.RING_FINGER_DIP),
+    "ring_03_l": (_HL.RING_FINGER_DIP, _HL.RING_FINGER_TIP),
+
+    "pinky_metacarpal_l": (_HL.WRIST, _HL.PINKY_MCP),
+    "pinky_01_l": (_HL.PINKY_MCP, _HL.PINKY_PIP),
+    "pinky_02_l": (_HL.PINKY_PIP, _HL.PINKY_DIP),
+    "pinky_03_l": (_HL.PINKY_DIP, _HL.PINKY_TIP),
+}
+# Same landmark indices apply against right_hand_world_landmarks - only the
+# bone names differ, so build FINGER_AIM_R by suffix rather than retyping it.
+FINGER_AIM_R: dict[str, tuple] = {name[:-1] + "r": pair for name, pair in FINGER_AIM_L.items()}
+FINGER_AIM: dict[str, tuple] = {**FINGER_AIM_L, **FINGER_AIM_R}
+
+
 class PoseSolver:
     def __init__(self, pelvis_default_height_cm: float = 95.0,
                  torso_lean_offset_deg: float = 0.0) -> None:
@@ -241,6 +363,7 @@ class PoseSolver:
         # performer standing relaxed and upright, or pass a value here.
         self.torso_lean_offset_deg = torso_lean_offset_deg
         self._build_rest_pose()
+        self._build_finger_rest_pose()
 
     def measure_torso_lean_deg(self, raw_world_landmarks: list[Any]) -> float:
         """Forward lean of the torso as MediaPipe reports it. Positive = leaning forward."""
@@ -302,6 +425,50 @@ class PoseSolver:
         right = normalize(np.cross(up, fwd))
         self.rest_body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
 
+    # -- finger rig rest pose, extending the FK chain past hand_l/hand_r ------
+    def _build_finger_rest_pose(self) -> None:
+        fi = self.full_idx
+        self.finger_rest_global: dict[str, R] = {
+            "hand_l": self.rest_global[fi["hand_l"]],
+            "hand_r": self.rest_global[fi["hand_r"]],
+        }
+        self.finger_rest_pos: dict[str, np.ndarray] = {
+            "hand_l": self.rest_pos[fi["hand_l"]],
+            "hand_r": self.rest_pos[fi["hand_r"]],
+        }
+        self.finger_bind_rot: dict[str, R] = {}
+        self.finger_bind_rot_dict: dict[str, dict] = {}
+        self.finger_bind_offset: dict[str, np.ndarray] = {}
+        self.finger_parent_of: dict[str, str] = {}
+        finger_child_of: dict[str, str] = {}
+
+        for name, parent, rot, off in FINGER_CHAIN:
+            q = ue_rotator_to_dict(*rot)
+            self.finger_bind_rot_dict[name] = q
+            self.finger_bind_rot[name] = R.from_quat([q["x"], q["y"], q["z"], q["w"]])
+            self.finger_bind_offset[name] = np.array(off, dtype=np.float64)
+            self.finger_parent_of[name] = parent
+            self.finger_rest_global[name] = self.finger_rest_global[parent] * self.finger_bind_rot[name]
+            self.finger_rest_pos[name] = (
+                self.finger_rest_pos[parent] + self.finger_rest_global[parent].apply(self.finger_bind_offset[name])
+            )
+            if parent not in ("hand_l", "hand_r"):
+                finger_child_of[parent] = name
+
+        # Rest direction each bone aims along: toward its own child bone when
+        # it has one, otherwise (the last phalanx of each finger) its local
+        # aim axis rotated into rest-global space - the same fallback used
+        # above for hand_l/hand_r's own rest_dir, since a fingertip bone has
+        # no further bone to point a direction at.
+        self.finger_rest_dir: dict[str, np.ndarray] = {}
+        for name, _, _, _ in FINGER_CHAIN:
+            if name in finger_child_of:
+                child = finger_child_of[name]
+                self.finger_rest_dir[name] = normalize(self.finger_rest_pos[child] - self.finger_rest_pos[name])
+            else:
+                axis = np.array([1.0, 0.0, 0.0]) if name.endswith("_l") else np.array([-1.0, 0.0, 0.0])
+                self.finger_rest_dir[name] = normalize(self.finger_rest_global[name].apply(axis))
+
     # -- landmark conversion ---------------------------------------------------
     def _convert_landmarks_to_ue_space(self, raw_landmarks: list[Any]) -> np.ndarray:
         """MediaPipe world landmarks -> (Fwd, Right, Up) in centimetres.
@@ -320,9 +487,19 @@ class PoseSolver:
         return [BoneTransform(name=name, rotation=dict(BIND_POSES[i]), position=dict(BIND_POSITIONS[i]))
                 for i, name in enumerate(BONE_NAMES)]
 
-    def solve(self, raw_world_landmarks: list[Any]) -> list[BoneTransform]:
+    def _solve_body_globals(
+        self, raw_world_landmarks: list[Any]
+    ) -> tuple[list[R], R, np.ndarray] | None:
+        """Shared by solve() and solve_hands(): computes every FULL_CHAIN
+        bone's global rotation, plus the whole-body orientation (body_rot)
+        and hip midpoint, from raw pose world landmarks. Returns None on the
+        same triggers solve() used to fall back to rest pose on (too few
+        landmarks, or a degenerate fwd/up) - each caller applies its own
+        fallback in that case. Pulled out of solve() so solve_hands() can
+        read hand_l/hand_r's global rotation from the exact same computation
+        solve() itself uses - not an independent approximation of it."""
         if len(raw_world_landmarks) < len(PoseLandmark):
-            return self._rest_pose_output()
+            return None
 
         pts = self._convert_landmarks_to_ue_space(raw_world_landmarks)
         comp = {int(k): PTS_TO_COMPONENT @ pts[int(k)] for k in PoseLandmark}
@@ -337,7 +514,7 @@ class PoseSolver:
         fwd = normalize(np.cross(up, side))
         right = normalize(np.cross(up, fwd))
         if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(up) < 1e-6:
-            return self._rest_pose_output()
+            return None
 
         if abs(self.torso_lean_offset_deg) > 1e-6:
             correction = R.from_rotvec(right * -math.radians(self.torso_lean_offset_deg))
@@ -348,7 +525,6 @@ class PoseSolver:
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
         body_rot = body_frame * self.rest_body_frame.inv()
 
-        fi = self.full_idx
         n_full = len(FULL_CHAIN)
         global_rot: list[R] = [R.identity()] * n_full
         for i in range(n_full):
@@ -369,6 +545,15 @@ class PoseSolver:
             else:
                 global_rot[i] = global_rot[parent] * self.full_bind[i]
 
+        return global_rot, body_rot, hip_mid
+
+    def solve(self, raw_world_landmarks: list[Any]) -> list[BoneTransform]:
+        solved = self._solve_body_globals(raw_world_landmarks)
+        if solved is None:
+            return self._rest_pose_output()
+        global_rot, _body_rot, hip_mid = solved
+
+        fi = self.full_idx
         pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
 
         result: list[BoneTransform] = []
@@ -385,3 +570,75 @@ class PoseSolver:
             result.append(BoneTransform(name=name, rotation=rot, position=pos))
 
         return result
+
+    # -- fingers ----------------------------------------------------------
+    def _rest_finger_bone(self, name: str) -> BoneTransform:
+        return BoneTransform(
+            name=name,
+            rotation=dict(self.finger_bind_rot_dict[name]),
+            position={"x": float(self.finger_bind_offset[name][0]),
+                      "y": float(self.finger_bind_offset[name][1]),
+                      "z": float(self.finger_bind_offset[name][2])},
+        )
+
+    def _solve_one_hand(
+        self,
+        side_suffix: str,
+        raw_hand_world_landmarks: list[Any],
+        body_rot: R | None,
+        root_global: R | None,
+    ) -> list[BoneTransform]:
+        names = [n for n in FINGER_BONE_NAMES if n.endswith(side_suffix)]
+        if body_rot is None or root_global is None or len(raw_hand_world_landmarks) < 21:
+            return [self._rest_finger_bone(name) for name in names]
+
+        pts = self._convert_landmarks_to_ue_space(raw_hand_world_landmarks)
+        comp = {i: PTS_TO_COMPONENT @ pts[i] for i in range(len(raw_hand_world_landmarks))}
+
+        global_rot: dict[str, R] = {("hand_l" if side_suffix == "_l" else "hand_r"): root_global}
+        for name in names:
+            a, b = FINGER_AIM[name]
+            aim = comp[int(b)] - comp[int(a)]
+            rest_world = body_rot.apply(self.finger_rest_dir[name])
+            global_rot[name] = swing_between(rest_world, aim) * body_rot * self.finger_rest_global[name]
+
+        result: list[BoneTransform] = []
+        for name in names:
+            parent = self.finger_parent_of[name]
+            local = global_rot[parent].inv() * global_rot[name]
+            qx, qy, qz, qw = local.as_quat()
+            result.append(BoneTransform(
+                name=name,
+                rotation={"x": float(qx), "y": float(qy), "z": float(qz), "w": float(qw)},
+                position={"x": float(self.finger_bind_offset[name][0]),
+                          "y": float(self.finger_bind_offset[name][1]),
+                          "z": float(self.finger_bind_offset[name][2])},
+            ))
+        return result
+
+    def solve_hands(
+        self,
+        pose_world_landmarks: list[Any],
+        left_hand_world_landmarks: list[Any],
+        right_hand_world_landmarks: list[Any],
+    ) -> tuple[list[BoneTransform], list[BoneTransform]]:
+        """Returns (left_hand_bones, right_hand_bones), each 19 long in
+        FINGER_CHAIN order. Either half falls back to bind pose independently
+        if that hand (or the body) isn't tracked this frame - never raises,
+        never returns a short list. hand_l/hand_r's own live orientation
+        comes straight out of _solve_body_globals(), the same computation
+        solve() uses for the streamed body bones - so finger parent-local
+        rotations always compose against the value actually being sent to
+        Unreal for that bone this frame."""
+        solved = self._solve_body_globals(pose_world_landmarks)
+        if solved is None:
+            body_rot, hand_l_global, hand_r_global = None, None, None
+        else:
+            global_rot, body_rot, _hip_mid = solved
+            fi = self.full_idx
+            hand_l_global = global_rot[fi["hand_l"]]
+            hand_r_global = global_rot[fi["hand_r"]]
+
+        left = self._solve_one_hand("_l", left_hand_world_landmarks, body_rot, hand_l_global)
+        right = self._solve_one_hand("_r", right_hand_world_landmarks, body_rot, hand_r_global)
+        return left, right

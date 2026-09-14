@@ -1,113 +1,227 @@
-# MediaPipe + Kimodo → MetaHuman LiveLink Architecture
+# project_kaspar — MediaPipe → Unreal Engine live mocap
 
 **Project:** project_kaspar
 
-**Status:** Architecture settled, `ILiveLinkSource` plugin implementation not yet started
+**Status:** the live-capture lane is built and working end to end — one webcam
+drives face (ARKit blendshapes + head rotation), full body pose, and finger
+tracking on Unreal Engine 5.8's "Manny" mannequin in real time. The second,
+generated-motion lane (Kimodo/SOMA, §9) has not been started.
 
 **Target engine:** Unreal Engine 5.8
 
 ## 1. Goal
 
-Drive a MetaHuman from two independent motion sources at once:
+Drive a character from two independent motion sources at once:
 
-- **Live capture** — a webcam feed processed through Google MediaPipe (face + body)
-- **Generated motion** — NVIDIA Kimodo/SOMA output, streamed as an offline gesture/motion library rather than real-time generation (Kimodo is diffusion-based and clip-output, evaluated as unsuitable for real-time generation directly)
+- **Live capture** *(this module, done)* — a webcam feed processed through Google
+  MediaPipe (face + body + hands)
+- **Generated motion** *(not started)* — NVIDIA Kimodo/SOMA output, streamed as an
+  offline gesture/motion library rather than real-time generation
 
-Both need to reach the same MetaHuman through one coherent, custom LiveLink pipeline, replacing the earlier Dummy + IK Retargeter approach that was built around Kimodo/SOMA alone.
+Both are meant to reach the same character through one coherent custom LiveLink
+pipeline. Only the live-capture lane exists in code today; everything below
+describes it as actually implemented, not as planned.
 
-## 2. High-level data flow
+## 2. Current pipeline
 
 ```
- MediaPipe Face          MediaPipe Pose         Kimodo / SOMA
- (webcam, ARKit              (webcam,           (generated motion,
-  blendshapes)             33 landmarks)             offline)
-        |                        |                        |
-        v                        v                        v
- Live Link Face UDP        OSC over UDP             OSC over UDP
-(fixed 61-float,          (custom pose +           (custom SOMA
- Epic's own protocol)      SOMA schema)              schema)
-        |                        \                       /
-        v                         \                     /
- Stock "Live Link              Custom LiveLink Source (C++)
-  Face" plugin                  ILiveLinkSource + FRunnable
- (ships with engine)            OSC receive thread, one plugin,
-        |                       multiple Subjects by name
-        |                                  |
-        +----------------+-----------------+
-                          v
-                  LiveLink Client (UE5)
-                Subjects, roles, buffering
-                          |
-                          v
-              Live Link Pose node → drives
-             "Manny" (Third Person Mannequin)
-                  animation blueprint directly
-                     (1:1 skeleton match,
-                      no retargeting needed here)
-                          |
-                          v
-              Runtime IK Retargeter (Blueprints)
-                  Manny (source) → MetaHuman
-                       (target), IK Rig +
-                    IK Retargeter asset pair
-                          |
-                          v
-                      MetaHuman
-              (face + body driven live)
+webcam (cv2, MJPG, up to 4K)
+  └─ conductor.py            owns the one shared camera, both detectors, both
+     │                       solvers, EMA/NLERP smoothing, debug overlay, and
+     │                       both UDP sockets. Nothing else touches the camera
+     │                       or a socket directly.
+     │
+     ├─ mediapipe_holistic_capture.py   HolisticLandmarker, ONE inference pass
+     │     │                            covering pose + face + both hands
+     │     ├─ PoseFrame   (33 world landmarks)
+     │     ├─ FaceFrame   (52 ARKit blendshapes + face mesh landmarks)
+     │     └─ HandsFrame  (21 landmarks x 2 hands, world + image space)
+     │
+     ├─ head_pose_capture.py           a second, much cheaper FaceLandmarker
+     │     └─ HeadPoseFrame (yaw/pitch/roll only)  — HolisticLandmarkerResult
+     │        has no transformation-matrix output, so this is the only source
+     │        for head rotation; conductor.py stitches it into FaceFrame.
+     │
+     ├─ pose_solver.py                 pure math - no MediaPipe/camera code,
+     │     │                           just landmarks in, BoneTransforms out
+     │     ├─ PoseSolver.solve(pose_landmarks)                  → 22 body bones
+     │     └─ PoseSolver.solve_hands(pose_lm, L_hand, R_hand)    → 19+19 finger bones
+     │          │
+     │          └─ live_link_pose_osc_protocol.py → OSC /mediapipe/pose, UDP 9001
+     │               └─ MediaPipeLiveLink (UE5 C++ ILiveLinkSource - see §5)
+     │
+     └─ live_link_face_protocol.py     FaceFrame + stitched head rotation
+           └─ UDP 11111 (raw, not OSC) → Epic's stock "Live Link Face" plugin
 ```
+
+`mediapipe_pose_capture.py` is not a detector any more - after the Holistic
+migration it's just the shared data model (`PoseLandmark` enum, `PoseFrame`
+dataclass) that `pose_solver.py`, `mediapipe_holistic_capture.py` and
+`conductor.py` all import, so none of them can drift out of sync on landmark
+order or field names.
+
+### Wire formats
+
+- **Face → UDP 11111.** Not OSC - Epic's own proprietary 61-float packet (the
+  same one the iOS Live Link Face app emits), reimplemented in
+  `live_link_face_protocol.py`. 52 ARKit blendshapes + headYaw/Pitch/Roll + 6
+  always-zero eye-rotation channels (MediaPipe gives eye-look blendshapes, not
+  a separate eye bone rotation). Consumed by the stock Live Link Face plugin -
+  zero custom UE code on this side.
+- **Pose + hands → OSC `/mediapipe/pose`, UDP 9001.** One message per frame:
+  `[present (1.0/0.0), then 7 floats per bone (position x/y/z, rotation
+  x/y/z/w)]` for all 60 bones (22 body + 19 left-hand + 19 right-hand,
+  fixed order) = `1 + 60*7 = 421` floats, **always** that length - even while
+  holding last-valid data with `present=0.0` - so the C++ side never has to
+  handle a variable-length packet.
+
+### Running it
+
+```powershell
+.\venv\Scripts\python.exe conductor.py --debug --camera 1
+```
+
+Needs `holistic_landmarker.task` and `face_landmarker.task` next to
+`conductor.py` (download links in each capture module's docstring).
+`pose_landmarker_full.task` is a leftover from before the Holistic migration -
+nothing loads it any more. In the debug window, press `c` while standing
+upright to calibrate away MediaPipe's ~18° forward-lean bias, `Esc` to quit.
+
+### Orphaned files, kept but not live
+
+- `mediapipe_pose_osc_protocol.py` - imported by `conductor.py` but only
+  reachable through dead code (a `'''...'''`-quoted block after an unconditional
+  `return`-equivalent). Predates `pose_solver.py`/OSC-bone-transform encoding.
+- `live_link_pose_json_protocol.py` - not imported anywhere. An alternate
+  JSON-based pose wire format that was never wired into `conductor.py`.
+- `ue_plugin/` (this repo) - the plugin's original home; superseded by a
+  synced copy at `K:\KaiTracking\Plugins\MediaPipeLiveLink`, which is the one
+  the project's `.uproject` now actually builds (see §5). Edit the C++ there,
+  not here - this copy no longer participates in the build.
 
 ## 3. Why two transport lanes instead of one
 
-**Face rides a shortcut that already exists.** Epic's stock "Live Link Face" plugin listens for a fixed, proprietary 61-float UDP packet — the same format the iOS Live Link Face app emits, based on ARKit's standardized 52-blendshape set. Because that schema is standardized, a fixed listener can exist at all. `mefamo.py`/`PyLiveLinkFace` (JimWest) work by spoofing that exact packet, so face capture needs zero custom UE-side code.
+**Face rides a shortcut that already exists.** Epic's stock "Live Link Face"
+plugin listens for a fixed, proprietary 61-float UDP packet - the same format
+the iOS Live Link Face app emits, based on ARKit's standardized 52-blendshape
+set. Because that schema is standardized, a fixed listener can exist at all.
 
-**Body has no equivalent shortcut.** There's no standardized schema for full-body skeletons the way there is for ARKit blendshapes — rig joint counts and naming vary per project. Epic doesn't ship a plug-and-play body listener, so body (MediaPipe Pose) and generated motion (Kimodo/SOMA) both require a real custom `ILiveLinkSource` plugin regardless of wire format.
+**Body (and now hands) have no equivalent shortcut.** There's no standardized
+schema for full-body skeletons the way there is for ARKit blendshapes - rig
+joint counts and naming vary per project. Epic doesn't ship a plug-and-play
+body listener, so pose+fingers (and, eventually, Kimodo/SOMA) both need a real
+custom `ILiveLinkSource` regardless of wire format.
 
 ## 4. Why OSC for the custom lane
 
-Not a universal "OSC beats JSON" claim — the decision was driven by two concrete factors:
+Not a universal "OSC beats JSON" claim:
 
-1. **Kimodo/SOMA already emits OSC.** Standardizing MediaPipe Pose on OSC too means one parser in the plugin instead of two.
-2. **Ecosystem compatibility** — OSC is the common language of real-time/show-control tooling (lighting, TouchDesigner, etc.), which may matter for a live theatrical context later.
+1. **Kimodo/SOMA already emits OSC** (per the original design survey) -
+   standardizing the pose lane on OSC too means one parser in the plugin
+   instead of two, once that lane exists.
+2. **Ecosystem compatibility** - OSC is the common language of
+   real-time/show-control tooling (lighting, TouchDesigner, etc.), which may
+   matter for a live theatrical context later.
 
-JSON was seriously considered and is a fully legitimate alternative — confirmed by reviewing DollarsMoCap's trial plugin, which streams body data as plain JSON over UDP (port 12351) with no measurable parsing bottleneck at real-world frame rates. Epic ships `Json`/`JsonUtilities` exactly as readily as the `OSC` module, so neither costs extra as a dependency. If Kimodo's OSC output weren't already a given, JSON would be an equally reasonable choice.
+JSON was a fully legitimate alternative (DollarsMoCap's trial plugin streams
+body data as plain JSON with no measurable parsing bottleneck) - Epic ships
+`Json`/`JsonUtilities` exactly as readily as `OSC`. If Kimodo's OSC output
+weren't already a given, JSON would be an equally reasonable choice.
 
-## 5. Custom `ILiveLinkSource` plugin — design, informed by DollarsMoCap's source
+## 5. Custom `ILiveLinkSource` plugin - what's actually built
 
-Reviewed DollarsMoCap's (Sunnyview Inc.) UE 5.8 trial plugin source directly. Patterns adopted:
+Lives at `K:\KaiTracking\Plugins\MediaPipeLiveLink` (this repo's `ue_plugin/`
+copy is stale - see §2). Simpler than the DollarsMoCap-derived design
+originally sketched here:
 
-- **Class shape:** one class implementing both `ILiveLinkSource` and `FRunnable`. `ReceiveClient()` starts a worker thread (`FRunnableThread::Create`); destructor sets an atomic "inactive" flag, calls `Stop()`, joins the thread, closes the socket.
-- **Socket:** `FUdpSocketBuilder`, non-blocking, polling loop with a short sleep — simple, proven sufficient.
-- **Thread-safety pattern (adopt as-is):** raw bytes are received on the worker thread; a `TSharedPtr<FThreadSafeBool>` "is this object still alive" flag is captured into the `AsyncTask(ENamedThreads::GameThread, ...)` lambda before touching `this`, guarding against the source being destroyed while a task is still queued (PIE stop, hot reload, source removal).
-- **Multiple Subjects per Source:** one socket, one plugin instance, can host several independently named LiveLink Subjects — a subject is auto-created (`CreateSubject`, idempotent via a `TSet` + critical section) the first time a new subject name is seen in an incoming frame. This is exactly how MediaPipe Pose and Kimodo/SOMA will coexist as two Subjects under one Source.
-- **Tracking-valid flag:** carried properly via `FLiveLinkSkeletonStaticData::PropertyNames` + `FLiveLinkAnimationFrameData::PropertyValues`, not as a fake bone. Reuse this mechanism for any confidence/valid flags MediaPipe or Kimodo need to signal.
-- **Target skeleton is Manny, not MetaHuman directly.** Since IK Retargeting happens downstream in Blueprints (Manny → MetaHuman), the plugin only ever needs to correctly drive Manny — a single, fixed, always-present skeleton. This settles an earlier open question: hardcoding Manny's real bone names/parent hierarchy and rest pose in C++ (as DollarsMoCap does) is the *correct* low-risk choice here, not a shortcut to avoid, precisely because Manny never changes and the target-skeleton variability (different MetaHuman body presets) is fully absorbed by the IK Retargeter, not the plugin.
-- **Rest-pose handling:** incoming quaternions are treated as deltas relative to a known rest pose, composed as `FinalRotation = BindPose * DeltaRotation`. Same math a Retarget Pose asset would do internally — just applied by hand here since the plugin's only target is the fixed Manny skeleton.
-- **Build.cs dependencies to mirror:**
-  - Public: `Core`, `LiveLinkInterface`, `LiveLink`, `LiveLinkAnimationCore`, `OSC` (swap in for DollarsMoCap's `Json`/`JsonUtilities`)
-  - Private: `CoreUObject`, `Engine`, `Sockets`, `Networking`, `Projects`, `InputCore` (`Slate`/`SlateCore` only if a custom connection-settings panel is built, otherwise skippable)
-- **A rough edge *not* to copy:** DollarsMoCap's receive buffer null-terminates at `ReceivedData[BytesRead]` with no bounds check against the buffer size — fine at their current payload size, but worth guarding properly.
+- **One class, `FMediaPipeLiveLinkSource`**, implements `ILiveLinkSource` and
+  `FGCObject` (to keep its `UOSCServer` alive against the garbage collector) -
+  no hand-rolled `FUdpSocketBuilder` + `FRunnable` worker thread. Epic's own
+  `OSC` module owns the socket and threading; the plugin just binds
+  `OnOscMessageReceivedNative`.
+- **All the retargeting math happens in Python, not C++.** `pose_solver.py`
+  sends already-fully-solved local bone quaternions; the plugin does nothing
+  more than `FTransform(FQuat(...), FVector(...))` per bone and pushes the
+  frame - it never composes against a bind pose itself. (An earlier version of
+  this doc described incoming quaternions as bind-pose deltas composed in
+  C++ - that's not what got built, and not what `pose_solver.py`'s own history
+  found correct either; see its module docstring.)
+- **Multiple Subjects per Source, auto-created:** `CreateSubject` is idempotent
+  via a `TSet` + critical section, matching the original plan - this is how a
+  future Kimodo/SOMA subject would coexist with `MediaPipePose` under the same
+  Source.
+- **Tracking-valid flag** carried via `FLiveLinkSkeletonStaticData::PropertyNames`
+  + `FLiveLinkAnimationFrameData::PropertyValues` (`"present"`), not a fake bone.
+- **Target skeleton is Manny, not a MetaHuman directly** - bone names/parents
+  are hardcoded (`MediaPipeBoneNames`/`MediaPipeBoneParents` in
+  `MediaPipeLiveLinkSource.cpp`, 60 entries: 22 body + 38 fingers), verified
+  against a `RefSkeleton` dump rather than guessed. `ExpectedArgs` is computed
+  from that array's length, not hardcoded, so extending it (as the finger
+  bones did) needed no other logic change.
+- **Build.cs**, for reference: Public - `Core`, `LiveLinkInterface`,
+  `LiveLink`, `LiveLinkAnimationCore`, `OSC`. Private - `CoreUObject`,
+  `Engine`, `Slate`, `SlateCore`, `Sockets`, `Networking`, `InputCore`.
 
-## 6. Downstream: Manny → MetaHuman retargeting
+## 6. Downstream: Manny → MetaHuman retargeting - not yet built
 
-- Live Link Pose node feeds Manny's Animation Blueprint directly (1:1 skeleton match, no retargeting at this stage).
-- A separate Actor Blueprint holds both a Manny (source) and MetaHuman (target) Skeletal Mesh Component, linked by an `IKRetargeter` asset built from a source IK Rig (Manny) and target IK Rig (MetaHuman), each with an editable Retarget Pose.
-- Solver choice is a live-performance-relevant tradeoff: **Full Body IK** gives the best proportion correction (foot/hand placement) but is the most expensive per frame; a cheaper **Body Mover + Limb IK Solvers** stack trades some correction quality for runtime cost, and is likely the better fit for a live show's frame budget. Not yet benchmarked.
-- One Manny → MetaHuman retarget setup serves both MediaPipe and Kimodo, since both drive the same Manny proxy upstream.
+Today, Live Link Pose drives Manny directly (1:1 skeleton match, no
+retargeting). Taking it further to a MetaHuman is still just a plan:
+
+- A separate Actor Blueprint would hold both a Manny (source) and MetaHuman
+  (target) Skeletal Mesh Component, linked by an `IKRetargeter` asset built
+  from a source IK Rig (Manny) and target IK Rig (MetaHuman).
+- Solver choice is a live-performance-relevant tradeoff: **Full Body IK** gives
+  the best proportion correction (foot/hand placement) but is the most
+  expensive per frame; a cheaper **Body Mover + Limb IK Solvers** stack trades
+  some correction quality for runtime cost. Not benchmarked.
+- One Manny → MetaHuman retarget setup would serve both MediaPipe and Kimodo,
+  since both would drive the same Manny proxy upstream.
 
 ## 7. Reference material
 
-- **JimWest/MeFaMo and JimWest/PyLiveLinkFace** — face capture reference. Both repositories were archived by the owner on 2026-08-13 (read-only, no further updates). They use the legacy `mediapipe.python.solutions.face_mesh` API, which Google deprecated in favor of the Tasks API (`mediapipe.tasks.python.vision.FaceLandmarker`/`PoseLandmarker`) after 2023. New code (the pose sender) uses the Tasks API instead.
-- **DollarsMoCap (Sunnyview Inc.) trial plugin** — reviewed both the wire protocol (via packet capture) and the full C++ plugin source, as detailed in §5 above.
-- MediaPipe's PyPI package currently supports **Python 3.9–3.12** only — no 3.13/3.14 wheels. A dedicated 3.11/3.12 environment is recommended, kept separate from any UE5 Python environment.
+- **JimWest/MeFaMo and JimWest/PyLiveLinkFace** - face capture reference. Both
+  archived by the owner on 2026-08-13. They use the legacy
+  `mediapipe.python.solutions.face_mesh` API, deprecated in favor of the Tasks
+  API after 2023 - this codebase uses the Tasks API throughout
+  (`HolisticLandmarker`/`FaceLandmarker`, see CLAUDE.md).
+- **DollarsMoCap (Sunnyview Inc.) trial plugin** - reviewed both its wire
+  protocol and full C++ source; the patterns actually adopted (multi-subject
+  auto-creation, the tracking-valid property, hardcoding Manny) are called out
+  in §5, alongside where the built plugin diverged from it.
+- MediaPipe's PyPI package currently supports **Python 3.9-3.12** only - no
+  3.13/3.14 wheels.
 
 ## 8. Delivered so far
 
-- `mediapipe_pose_sender.py` — MediaPipe PoseLandmarker (Tasks API) webcam capture, sends world-space landmarks (metric, hip-centered) as a single OSC message per frame to a configurable host/port. Uses a `PoseLandmark` enum mirroring BlazePose's 33-joint topology.
+- **Face**: HolisticLandmarker blendshapes + a second slim FaceLandmarker pass
+  for head yaw/pitch/roll (HolisticLandmarkerResult has no transformation-matrix
+  equivalent) → Epic's stock Live Link Face plugin. Working.
+- **Body**: `pose_solver.py`'s `solve()` - per-bone minimal-swing rotation
+  from rest direction to measured direction, converted to parent-local in
+  Unreal's component space. 22 bones, verified against three acceptance tests
+  (see CLAUDE.md).
+- **Fingers**: `pose_solver.py`'s `solve_hands()` - the identical technique
+  extended one layer past hand_l/hand_r, verified against a real
+  `RefSkeleton` dump of Manny's finger rig (19 bones/hand: metacarpal + 3
+  phalanges x 4 fingers, 3 phalanges for the thumb). Every phalanx joint
+  round-trips to 0.000° error in the bind-pose test; metacarpals carry a
+  few degrees from a disclosed, accepted approximation (no MediaPipe landmark
+  sits at each finger's individual palm offset - see `pose_solver.py`).
+- **Custom UE5 plugin** (`MediaPipeLiveLink`, §5) - built on Epic's `OSC`
+  module, dynamic bone count, multi-subject-ready, driving Manny live.
+- **Debug overlay** - full pose/face-mesh/hand landmark drawing, tracking
+  status per channel, live torso-lean readout + one-key calibration.
 
 ## 9. Open items / next steps
 
-- Write the C++ `ILiveLinkSource` + `ILiveLinkSourceFactory` plugin pair (body: Manny skeleton static/frame data + OSC receive loop; face: none needed, already solved via the stock plugin).
-- Solve landmark-position → bone-local-rotation math for the MediaPipe Pose sender (or push raw landmark positions and do the conversion plugin-side) — not yet designed.
-- Define the OSC address/schema for MediaPipe Pose and for Kimodo/SOMA under the shared custom Source (e.g. `/mediapipe/pose`, `/kimodo/pose`), including a per-subject tracking-valid flag mirroring DollarsMoCap's `present` field.
-- Benchmark Full Body IK vs. Body Mover + Limb IK Solvers for the Manny → MetaHuman retarget step under live-performance frame budget.
-- Decide the actual rest pose / bind pose values for Manny to hardcode into the plugin (mirroring DollarsMoCap's approach, adapted to whatever pose MediaPipe/Kimodo output assumes as neutral).
+- **Kimodo/SOMA lane**: not started - no code in this module talks to it yet.
+- **Manny → MetaHuman retargeting** (§6): not built - Manny is the final
+  driven skeleton today.
+- **Finger twist**: unconstrained, same limitation as body twist - MediaPipe
+  gives joint positions, not rotations, so forearm pronation and finger roll
+  can't be observed either.
+- **Cleanup candidates**: the orphaned files in §2 (`mediapipe_pose_osc_protocol.py`,
+  `live_link_pose_json_protocol.py`, `pose_landmarker_full.task`, this repo's
+  `ue_plugin/` copy) could be removed once nobody needs them as reference.
+- Benchmark Full Body IK vs. Body Mover + Limb IK Solvers, once MetaHuman
+  retargeting is actually being built.
