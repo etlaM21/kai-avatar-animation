@@ -230,9 +230,32 @@ INTERNAL_BONES = {"spine_03", "spine_05", "neck_02"}
 
 
 class PoseSolver:
-    def __init__(self, pelvis_default_height_cm: float = 95.0) -> None:
+    def __init__(self, pelvis_default_height_cm: float = 95.0,
+                 torso_lean_offset_deg: float = 0.0) -> None:
         self.pelvis_default_height_cm = pelvis_default_height_cm
+        # MediaPipe's world landmarks place the shoulders in front of the hips, so a
+        # performer standing vertically is reported as leaning ~18 deg forward. The bias
+        # is near-constant (measured +17.8 deg on a vertical subject and +20.0 deg on a
+        # subject actually leaning backwards), so it is removed as a calibration offset
+        # rather than by changing the solve. Call calibrate_neutral() once with the
+        # performer standing relaxed and upright, or pass a value here.
+        self.torso_lean_offset_deg = torso_lean_offset_deg
         self._build_rest_pose()
+
+    def measure_torso_lean_deg(self, raw_world_landmarks: list[Any]) -> float:
+        """Forward lean of the torso as MediaPipe reports it. Positive = leaning forward."""
+        if len(raw_world_landmarks) < len(PoseLandmark):
+            return 0.0
+        pts = self._convert_landmarks_to_ue_space(raw_world_landmarks)
+        hip_mid = (pts[int(_P.LEFT_HIP)] + pts[int(_P.RIGHT_HIP)]) * 0.5
+        shoulder_mid = (pts[int(_P.LEFT_SHOULDER)] + pts[int(_P.RIGHT_SHOULDER)]) * 0.5
+        up = normalize(shoulder_mid - hip_mid)
+        return math.degrees(math.atan2(float(up[0]), float(up[2])))
+
+    def calibrate_neutral(self, raw_world_landmarks: list[Any]) -> float:
+        """Record the current lean as 'upright'. Returns the offset now in use."""
+        self.torso_lean_offset_deg = self.measure_torso_lean_deg(raw_world_landmarks)
+        return self.torso_lean_offset_deg
 
     # -- rig rest pose, in component space -------------------------------------
     def _build_rest_pose(self) -> None:
@@ -315,6 +338,12 @@ class PoseSolver:
         right = normalize(np.cross(up, fwd))
         if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(up) < 1e-6:
             return self._rest_pose_output()
+
+        if abs(self.torso_lean_offset_deg) > 1e-6:
+            correction = R.from_rotvec(right * -math.radians(self.torso_lean_offset_deg))
+            up = normalize(correction.apply(up))
+            fwd = normalize(np.cross(up, side))
+            right = normalize(np.cross(up, fwd))
 
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
         body_rot = body_frame * self.rest_body_frame.inv()
