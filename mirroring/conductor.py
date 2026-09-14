@@ -266,6 +266,12 @@ class Conductor:
  
     def _handle_pose(self, frame: PoseFrame, timestamp_ms: int) -> None:
         if frame.valid and len(frame.world_landmarks) > 0:
+            # Log world pose landmarks
+            '''
+            for lm_enum in PoseLandmark:
+                lm = frame.world_landmarks[int(lm_enum)]
+                print(lm_enum.name, lm.x, lm.y, lm.z)
+            '''
             # Get raw solved bones from MediaPipe
             raw_bones = self.pose_solver.solve(frame.world_landmarks)
             self._last_valid_bone_transforms = raw_bones
