@@ -12,14 +12,16 @@ Engine endpoints.
             there is no stock listener the way there is for face. See
             the "NEXT STEPS" comment at the bottom of this file.
  
-Why one shared camera feeding two detectors, instead of two separate
+Why one shared camera feeding both detectors, instead of two separate
 scripts each with their own: most webcams only allow one reader at a
 time. Two processes each independently calling cv2.VideoCapture(0)
 tend to fight over the device (one fails to open, or gets a frozen
 feed). Conductor captures exactly once per loop and hands the same
-frame to both MediaPipeFaceCapture.process() and
-MediaPipePoseCapture.process(), which removes that conflict at its root
-instead of routing around it (e.g. with a virtual camera app).
+frame to both MediaPipeHolisticCapture.process() (pose, face, hands
+in one pass) and HeadPoseCapture.process() (head yaw/pitch/roll only,
+via a second, much cheaper FaceLandmarker - HolisticLandmarkerResult
+has no transformation-matrix output), which removes that conflict at
+its root instead of routing around it (e.g. with a virtual camera app).
  
 Responsibilities, per loop iteration:
     1. Capture ONE frame from the one shared camera.
@@ -56,8 +58,9 @@ import numpy as np
  
 from live_link_face_protocol import CHANNEL_ORDER as FACE_CHANNEL_ORDER
 from live_link_face_protocol import LiveLinkFaceEncoder
-from mediapipe_face_capture import FaceFrame, MediaPipeFaceCapture
-from mediapipe_pose_capture import MediaPipePoseCapture, PoseFrame, PoseLandmark
+from head_pose_capture import HeadPoseCapture
+from mediapipe_holistic_capture import FaceFrame, HandsFrame, MediaPipeHolisticCapture
+from mediapipe_pose_capture import PoseFrame, PoseLandmark
 from mediapipe_pose_osc_protocol import (
     POSE_CHANNEL_ORDER,
     PoseOSCEncoder,
@@ -75,6 +78,7 @@ from mediapipe.tasks.python.vision import (
     drawing_styles,
     PoseLandmarksConnections,
     FaceLandmarksConnections,
+    HandLandmarksConnections,
 )
  
 LIVE_LINK_FACE_PORT = 11111  # Unreal's stock Live Link Face plugin default
@@ -216,8 +220,8 @@ class Conductor:
 
     def __init__(
         self,
-        face_capture: MediaPipeFaceCapture,
-        pose_capture: MediaPipePoseCapture,
+        holistic_capture: MediaPipeHolisticCapture,
+        head_pose_capture: HeadPoseCapture,
         camera_index: int = 0,
         camera_width: int | None = None,
         camera_height: int | None = None,
@@ -231,8 +235,8 @@ class Conductor:
         pose_smoothing_alpha: float = 0.5,
         show_debug: bool = False,
     ) -> None:
-        self.face_capture = face_capture
-        self.pose_capture = pose_capture
+        self.holistic_capture = holistic_capture
+        self.head_pose_capture = head_pose_capture
         self.show_debug = show_debug
         self._warned_no_pose_lms = False
         self._warned_no_face_lms = False
@@ -280,6 +284,12 @@ class Conductor:
         self._last_valid_bone_transforms: list[BoneTransform] = []
         # Kept so the 'c' key can calibrate the torso lean from the live frame.
         self._last_valid_world_landmarks: list = []
+        # Held per-hand (not per-frame) so one hand losing tracking doesn't
+        # snap ITS fingers to bind pose while the other hand keeps moving -
+        # same "hold last valid" rationale as _last_valid_bone_transforms.
+        # Empty until the first valid detection, same as that list.
+        self._last_valid_left_hand_bones: list[BoneTransform] = []
+        self._last_valid_right_hand_bones: list[BoneTransform] = []
  
     # ---- timing ---------------------------------------------------------
  
@@ -294,7 +304,7 @@ class Conductor:
         values = dict(frame.blendshapes)
         # First-pass scale: degrees -> roughly [-1, 1], the range Live
         # Link Face expects for head rotation. Already empirically tuned
-        # in mediapipe_face_capture.py's rotation decomposition itself.
+        # in head_pose_capture.py's rotation decomposition itself.
         values["headYaw"] = frame.head_yaw_deg / 90.0
         values["headPitch"] = frame.head_pitch_deg / 90.0
         values["headRoll"] = frame.head_roll_deg / 90.0
@@ -333,30 +343,44 @@ class Conductor:
         packet = self.face_encoder.encode(smoothed)
         self.face_socket.sendto(packet, self.face_target)
  
-    def _handle_pose(self, frame: PoseFrame, timestamp_ms: int) -> None:
+    def _handle_pose(self, frame: PoseFrame, timestamp_ms: int, hands_frame: HandsFrame) -> None:
         if frame.valid and len(frame.world_landmarks) > 0:
-            # Log world pose landmarks
-            '''
-            for lm_enum in PoseLandmark:
-                lm = frame.world_landmarks[int(lm_enum)]
-                print(lm_enum.name, lm.x, lm.y, lm.z)
-            '''
             # Get raw solved bones from MediaPipe
             raw_bones = self.pose_solver.solve(frame.world_landmarks)
             self._last_valid_bone_transforms = raw_bones
             self._last_valid_world_landmarks = frame.world_landmarks
-
-            # Apply quaternion-safe smoothing
-            smoothed_bones = self.pose_smoother.apply(raw_bones)
-            self.pose_encoder.send(smoothed_bones, present=True)
+            present = True
         else:
             # Hold the last valid rig pose if tracking drops out
-            transforms_to_send = (
+            raw_bones = (
                 self._last_valid_bone_transforms
                 if self._last_valid_bone_transforms
-                else self.pose_solver.solve([]) # Fallback to identity rest pose
+                else self.pose_solver.solve([])  # Fallback to identity rest pose
             )
-            self.pose_encoder.send(transforms_to_send, present=False)
+            present = False
+
+        # Fingers ride along in the same message. solve_hands() falls back to
+        # bind pose per-hand on its own when a hand isn't tracked; hold the
+        # last valid finger pose instead, same "don't snap to neutral"
+        # rationale as the body and face channels, but per-hand so one hand
+        # losing tracking doesn't affect the other.
+        left_bones, right_bones = self.pose_solver.solve_hands(
+            frame.world_landmarks, hands_frame.left.world_landmarks, hands_frame.right.world_landmarks
+        )
+        if hands_frame.left.valid:
+            self._last_valid_left_hand_bones = left_bones
+        elif self._last_valid_left_hand_bones:
+            left_bones = self._last_valid_left_hand_bones
+        if hands_frame.right.valid:
+            self._last_valid_right_hand_bones = right_bones
+        elif self._last_valid_right_hand_bones:
+            right_bones = self._last_valid_right_hand_bones
+
+        # Apply quaternion-safe smoothing to body + both hands together -
+        # PoseSmoother keys purely by BoneTransform.name, so this needed no
+        # changes to support more bones.
+        smoothed_bones = self.pose_smoother.apply(raw_bones + left_bones + right_bones)
+        self.pose_encoder.send(smoothed_bones, present=present)
         '''
         present = frame.valid  # the flag Live Link Face's protocol has no room for -> validates that a pose is currently present
         if frame.valid:
@@ -379,11 +403,12 @@ class Conductor:
         Deliberately not frame.world_landmarks: those are metric and hip-centred,
         so drawing them over the picture would put a skeleton in the corner.
 
-        The Tasks API returns one landmark list PER DETECTED PERSON/FACE, i.e.
-        result.pose_landmarks is a list of lists. If the frame stored that outer
-        list verbatim, unwrap the first entry; if it already stored [0], use it
-        as-is. Field naming is up to the capture modules, so try the plausible
-        names and give up quietly rather than killing the loop.
+        Handles two different shapes defensively: FaceLandmarker/PoseLandmarker
+        return one landmark list PER DETECTED PERSON/FACE (a list of lists) -
+        unwrap the first entry in that case. HolisticLandmarker's lists are
+        already flat (single detection per image), so use them as-is. Field
+        naming is up to the capture modules, so try the plausible names and
+        give up quietly rather than killing the loop.
         """
         for attr in ("landmarks", "image_landmarks", "normalized_landmarks",
                      "pose_landmarks", "face_landmarks"):
@@ -397,7 +422,8 @@ class Conductor:
             return list(value)
         return None
 
-    def _draw_debug(self, frame, face_frame: FaceFrame, pose_frame: PoseFrame) -> int:
+    def _draw_debug(self, frame, face_frame: FaceFrame, pose_frame: PoseFrame,
+                     hands_frame: HandsFrame | None = None) -> int:
         """Combined webcam view: tracking status plus the full landmark overlay
         for both channels. Returns the key pressed, so the caller can act on it."""
         pose_lms = self._image_landmarks(pose_frame) if pose_frame.valid else None
@@ -431,6 +457,16 @@ class Conductor:
             print("[debug] FaceFrame exposes no image-space landmarks - mesh overlay "
                   "disabled. Expose the Tasks API's result.face_landmarks on FaceFrame.")
             self._warned_no_face_lms = True
+
+        if hands_frame:
+            for hand in (hands_frame.left, hands_frame.right):
+                if hand.valid and hand.landmarks:
+                    drawing_utils.draw_landmarks(
+                        image=frame, landmark_list=hand.landmarks,
+                        connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                        landmark_drawing_spec=drawing_styles.get_default_hand_landmarks_style(),
+                        connection_drawing_spec=drawing_styles.get_default_hand_connections_style(),
+                    )
 
         # Text drawn in pixels on a 4K frame would be unreadable once the window is
         # scaled down, so scale it with the frame height.
@@ -473,17 +509,27 @@ class Conductor:
                 # API landmarkers reading the *same* mp.Image concurrently
                 # is safe - this costs one extra cheap wrap, not a real
                 # performance concern next to the model inference itself.
-                face_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                pose_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
- 
-                face_frame = self.face_capture.process(face_mp_image, ts)
-                pose_frame = self.pose_capture.process(pose_mp_image, ts)
- 
+                holistic_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                head_pose_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                pose_frame, face_frame, hands_frame = self.holistic_capture.process(holistic_mp_image, ts)
+                head_pose_frame = self.head_pose_capture.process(head_pose_mp_image, ts)
+                # HolisticLandmarkerResult has no transformation-matrix
+                # equivalent, so head rotation is stitched in from the
+                # separate slim FaceLandmarker pass. Leave face_frame's
+                # 0.0 defaults in place if that pass missed this frame -
+                # _handle_face's hold-last-valid logic then carries the
+                # last known head pose forward, same as it already does
+                # for every other face channel.
+                if head_pose_frame.valid:
+                    face_frame.head_yaw_deg = head_pose_frame.yaw_deg
+                    face_frame.head_pitch_deg = head_pose_frame.pitch_deg
+                    face_frame.head_roll_deg = head_pose_frame.roll_deg
                 self._handle_face(face_frame)
-                self._handle_pose(pose_frame, ts)
- 
+                self._handle_pose(pose_frame, ts, hands_frame)
+
                 if self.show_debug:
-                    key = self._draw_debug(raw_frame, face_frame, pose_frame)
+                    key = self._draw_debug(raw_frame, face_frame, pose_frame, hands_frame)
                     if key == ord("c") and self._last_valid_world_landmarks:
                         offset = self.pose_solver.calibrate_neutral(self._last_valid_world_landmarks)
                         print(f"Torso lean calibrated: offset {offset:+.1f} deg")
@@ -493,16 +539,16 @@ class Conductor:
             pass
         finally:
             self.cap.release()
-            self.face_capture.close()
-            self.pose_capture.close()
+            self.holistic_capture.close()
+            self.head_pose_capture.close()
             self.face_socket.close()
             if self.show_debug:
                 cv2.destroyAllWindows()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--face-model", default="face_landmarker.task")
-    parser.add_argument("--pose-model", default="pose_landmarker_full.task")
+    parser.add_argument("--holistic-model", default="holistic_landmarker.task")
+    parser.add_argument("--head-pose-model", default="face_landmarker.task")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=None,
                          help="force a capture width; default picks the highest mode the camera accepts")
@@ -527,18 +573,18 @@ def main() -> None:
                          help="show a combined webcam + tracking-status debug window")
     args = parser.parse_args()
  
-    for label, path in (("Face", args.face_model), ("Pose", args.pose_model)):
+    for label, path in (("Holistic", args.holistic_model), ("Head pose", args.head_pose_model)):
         if not Path(path).exists():
             raise FileNotFoundError(
-                f"{label} model not found at {path}. See mediapipe_face_capture.py's "
-                "and mediapipe_pose_capture.py's module docstrings for download links."
+                f"{label} model not found at {path}. See mediapipe_holistic_capture.py's "
+                "and head_pose_capture.py's module docstrings for download links."
             )
- 
-    face_capture = MediaPipeFaceCapture(model_path=args.face_model)
-    pose_capture = MediaPipePoseCapture(model_path=args.pose_model)
- 
+
+    holistic_capture = MediaPipeHolisticCapture(model_path=args.holistic_model)
+    head_pose_capture = HeadPoseCapture(model_path=args.head_pose_model)
+
     conductor = Conductor(
-        face_capture, pose_capture,
+        holistic_capture, head_pose_capture,
         camera_index=args.camera,
         camera_width=args.width, camera_height=args.height,
         torso_lean_offset_deg=args.torso_lean_offset,
@@ -554,33 +600,3 @@ def main() -> None:
  
 if __name__ == "__main__":
     main()
- 
-# ---- NEXT STEPS ----------------------------------------------------------
-#
-# Face: done. Add a Live Link Face source in UE5's Live Link panel
-# (listens on 11111 by default) and it should just work.
-#
-# Pose: two separate pieces of work remain, and they're independent of
-# each other - either order is fine:
-#
-#   1. The custom ILiveLinkSource C++ plugin. Nothing in Unreal is
-#      listening on port 9001 yet - these OSC packets currently go
-#      nowhere. Before writing any C++, sanity-check the wire format
-#      first with a plain OSC monitor (a five-line python-osc dummy
-#      server, or a tool like Protokol) and confirm you see 168 args
-#      per message, present flipping 0/1 as you step in and out of
-#      frame, and values changing as you move - cheap to verify, and
-#      isolates "is my data right" from "is my C++ right" as separate
-#      questions.
-#
-#   2. Landmark positions -> actual bone rotations. This is the "why
-#      don't the landmarks form a rig" question - see the chat answer
-#      for the full explanation. Short version: MediaPipe only gives you
-#      33 point *positions* in space, never rotations, and a rig needs
-#      rotations. This conversion doesn't exist yet anywhere in this
-#      pipeline. Worth doing in Python (numpy/scipy have solid rotation
-#      math, easier to iterate on than C++) before sending over OSC,
-#      producing bone-style rotation+position data closer to what
-#      DollarsMoCap's body channel already looked like - which would
-#      also make the eventual C++ plugin simpler, since it wouldn't
-#      need to know anything about landmark math at all.

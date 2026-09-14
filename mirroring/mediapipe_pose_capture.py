@@ -1,35 +1,19 @@
 """
-MediaPipe Pose capture module - the "MediaPipe Pose" detector.
+Pose data model - shared by mediapipe_holistic_capture.py, pose_solver.py and
+mediapipe_pose_osc_protocol.py.
 
-Pure ML inference wrapper, mirroring mediapipe_face_capture.py exactly:
-given an already-captured frame (mp.Image) and a timestamp, runs
-PoseLandmarker (Tasks API, LIVE_STREAM mode) and returns a PoseFrame.
-No camera ownership here either - see mediapipe_face_capture.py's
-module docstring for why that responsibility now lives in Conductor.
-
-Requires:
-    pip install mediapipe opencv-python
-
-Model:
-    Download pose_landmarker_full.task from the MediaPipe Pose
-    Landmarker model index and place it next to this script, or pass
-    --pose-model to conductor.py.
+Detection itself now happens inside HolisticLandmarker (see
+mediapipe_holistic_capture.py) rather than a standalone PoseLandmarker, but
+PoseLandmark and PoseFrame are kept in this module - unchanged in shape and
+meaning - so pose_solver.py's `from mediapipe_pose_capture import
+PoseLandmark` and every other existing import site keep working without
+edits.
 """
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
-
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import (
-    PoseLandmarker,
-    PoseLandmarkerOptions,
-    PoseLandmarkerResult,
-    RunningMode,
-)
 
 
 class PoseLandmark(IntEnum):
@@ -85,64 +69,6 @@ class PoseFrame:
     timestamp_ms: int
     # Both lists, when valid, have exactly NUM_POSE_LANDMARKS entries, each
     # an object with .x .y .z .visibility .presence - the same shape
-    # MediaPipe returns, just already unwrapped from "list of one pose"
-    # (result.pose_landmarks[0]) since num_poses=1 below.
+    # MediaPipe returns.
     landmarks: list = field(default_factory=list)        # image-normalized
     world_landmarks: list = field(default_factory=list)  # metric, hip-centered
-
-
-class MediaPipePoseCapture:
-    """Wraps PoseLandmarker. Owns no camera - call process() once per frame."""
-
-    def __init__(self, model_path: str = "pose_landmarker_full.task") -> None:
-        self._lock = threading.Lock()
-        self._latest_result: PoseLandmarkerResult | None = None
-
-        # All option names here are snake_case - the Python Tasks API is
-        # snake_case throughout, no exceptions. (MediaPipe's docs mix in
-        # JS/Android camelCase examples on the same pages, which is an
-        # easy trap - cross-check against a working Python call if in doubt.)
-        options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=RunningMode.LIVE_STREAM,
-            num_poses=1,
-            output_segmentation_masks=False,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-            result_callback=self._on_result,
-        )
-        self.landmarker = PoseLandmarker.create_from_options(options)
-
-    def _on_result(
-        self,
-        result: PoseLandmarkerResult,
-        output_image: mp.Image,
-        timestamp_ms: int,
-    ) -> None:
-        with self._lock:
-            self._latest_result = result
-
-    def process(self, mp_image: mp.Image, timestamp_ms: int) -> PoseFrame:
-        """Same async-dispatch-then-read-latest pattern as
-        MediaPipeFaceCapture.process() - see its docstring for the
-        LIVE_STREAM lag caveat, which applies identically here."""
-        self.landmarker.detect_async(mp_image, timestamp_ms)
-
-        with self._lock:
-            result = self._latest_result
-
-        if not result or not result.pose_landmarks:
-            return PoseFrame(valid=False, timestamp_ms=timestamp_ms)
-
-        return PoseFrame(
-            valid=True,
-            timestamp_ms=timestamp_ms,
-            landmarks=result.pose_landmarks[0],
-            # note: pose_world_landmarks, not worldLandmarks - snake_case,
-            # same trap as the options above.
-            world_landmarks=result.pose_world_landmarks[0],
-        )
-
-    def close(self) -> None:
-        self.landmarker.close()

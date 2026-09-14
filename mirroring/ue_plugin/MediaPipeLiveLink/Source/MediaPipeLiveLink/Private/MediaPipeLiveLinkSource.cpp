@@ -6,16 +6,48 @@
 
 const FName FMediaPipeLiveLinkSource::DefaultSubjectName(TEXT("MediaPipePose"));
 
+// Indices 0-21: Manny's body, unchanged. Indices 22-59: 19 finger bones per
+// hand (a metacarpal + 3 phalanges for index/middle/ring/pinky, 3 phalanges
+// only for the thumb - Manny has no thumb metacarpal), appended by
+// hand_solver.py after pose_solver.py's 22 body bones - see that file's
+// FINGER_CHAIN for where these names/parents come from (a RefSkeleton dump
+// of SKM_Manny_Simple, not guessed).
 static const TArray<FName> MediaPipeBoneNames = {
     TEXT("pelvis"), TEXT("spine_01"), TEXT("spine_02"), TEXT("spine_04"), TEXT("neck_01"), TEXT("head"),
     TEXT("clavicle_l"), TEXT("upperarm_l"), TEXT("lowerarm_l"), TEXT("hand_l"),
     TEXT("clavicle_r"), TEXT("upperarm_r"), TEXT("lowerarm_r"), TEXT("hand_r"),
     TEXT("thigh_l"), TEXT("calf_l"), TEXT("foot_l"), TEXT("ball_l"),
-    TEXT("thigh_r"), TEXT("calf_r"), TEXT("foot_r"), TEXT("ball_r")
+    TEXT("thigh_r"), TEXT("calf_r"), TEXT("foot_r"), TEXT("ball_r"),
+
+    TEXT("thumb_01_l"), TEXT("thumb_02_l"), TEXT("thumb_03_l"),
+    TEXT("index_metacarpal_l"), TEXT("index_01_l"), TEXT("index_02_l"), TEXT("index_03_l"),
+    TEXT("middle_metacarpal_l"), TEXT("middle_01_l"), TEXT("middle_02_l"), TEXT("middle_03_l"),
+    TEXT("ring_metacarpal_l"), TEXT("ring_01_l"), TEXT("ring_02_l"), TEXT("ring_03_l"),
+    TEXT("pinky_metacarpal_l"), TEXT("pinky_01_l"), TEXT("pinky_02_l"), TEXT("pinky_03_l"),
+
+    TEXT("thumb_01_r"), TEXT("thumb_02_r"), TEXT("thumb_03_r"),
+    TEXT("index_metacarpal_r"), TEXT("index_01_r"), TEXT("index_02_r"), TEXT("index_03_r"),
+    TEXT("middle_metacarpal_r"), TEXT("middle_01_r"), TEXT("middle_02_r"), TEXT("middle_03_r"),
+    TEXT("ring_metacarpal_r"), TEXT("ring_01_r"), TEXT("ring_02_r"), TEXT("ring_03_r"),
+    TEXT("pinky_metacarpal_r"), TEXT("pinky_01_r"), TEXT("pinky_02_r"), TEXT("pinky_03_r"),
 };
 
 static const TArray<int32> MediaPipeBoneParents = {
-    -1, 0, 1, 2, 3, 4, 3, 6, 7, 8, 3, 10, 11, 12, 0, 14, 15, 16, 0, 18, 19, 20
+    -1, 0, 1, 2, 3, 4, 3, 6, 7, 8, 3, 10, 11, 12, 0, 14, 15, 16, 0, 18, 19, 20,
+
+    // left hand (parent 9 = hand_l)
+    9, 22, 23,
+    9, 25, 26, 27,
+    9, 29, 30, 31,
+    9, 33, 34, 35,
+    9, 37, 38, 39,
+
+    // right hand (parent 13 = hand_r)
+    13, 41, 42,
+    13, 44, 45, 46,
+    13, 48, 49, 50,
+    13, 52, 53, 54,
+    13, 56, 57, 58,
 };
 
 FMediaPipeLiveLinkSource::FMediaPipeLiveLinkSource(const FMediaPipeLiveLinkSettings& InSettings)
