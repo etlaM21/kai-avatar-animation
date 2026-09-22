@@ -226,10 +226,26 @@ BONE_AIM: dict[str, tuple] = {
     "foot_r":     (_P.RIGHT_ANKLE, _P.RIGHT_FOOT_INDEX),
 }
 
-# Bones carried rigidly by the torso/neck frame rather than aimed at a landmark.
-TORSO_BONES = {"pelvis", "spine_01", "spine_02", "spine_04", "neck_01", "head"}
+# Bones carried rigidly by the torso frame rather than aimed at a landmark.
+TORSO_BONES = {"pelvis", "spine_01", "spine_02", "spine_04"}
 # Present in the rig and needed for correct parenting, but never streamed.
-INTERNAL_BONES = {"spine_03", "spine_05", "neck_02"}
+# neck_02 is deliberately NOT here: it sits between neck_01 and head, and Unreal
+# holds it at bind RELATIVE TO neck_01 - so once neck_01 rotates independently of
+# the torso, neck_02 has to follow neck_01 by FK (the generic branch), not the torso.
+INTERNAL_BONES = {"spine_03", "spine_05"}
+# Share of the head's rotation (relative to the torso) given to neck_01; head gets
+# the full orientation on top. Anatomically the cervical spine and the skull joint
+# split the motion; 0.4 is a visual choice, not a measured value.
+NECK_SHARE = 0.4
+
+# Holistic face mesh indices for the head basis. Chosen for being bone-backed, so
+# expressions don't move them: cheek contour extremes for the side axis (454 is the
+# performer's LEFT - it lies on the image's right), eye outer corners to stabilise
+# it, forehead top (10) and chin (152) for the up axis. The chin moves a little with
+# jaw opening; eye->mouth would move with every smile.
+FACE_LEFT, FACE_RIGHT = 454, 234
+FACE_EYE_LEFT, FACE_EYE_RIGHT = 263, 33
+FACE_TOP, FACE_CHIN = 10, 152
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +378,15 @@ class PoseSolver:
         # rather than by changing the solve. Call calibrate_neutral() once with the
         # performer standing relaxed and upright, or pass a value here.
         self.torso_lean_offset_deg = torso_lean_offset_deg
+        # Head orientation relative to the torso, as a rotation in the torso frame.
+        # Held across face-detection dropouts (a moment of lost face tracking
+        # shouldn't snap the head back onto the chest); identity until a face is seen.
+        self._head_rel = R.identity()
+        # Head pose recorded as "looking straight ahead" by calibrate_neutral(). The
+        # face-mesh basis isn't exactly the rig's head axes (forehead->chin leans back
+        # a few degrees, people carry their heads differently). Identity = mesh as-is.
+        self.head_neutral = R.identity()
+        self._last_face_rot: R | None = None
         self._build_rest_pose()
         self._build_finger_rest_pose()
 
@@ -376,9 +401,53 @@ class PoseSolver:
         return math.degrees(math.atan2(float(up[0]), float(up[2])))
 
     def calibrate_neutral(self, raw_world_landmarks: list[Any]) -> float:
-        """Record the current lean as 'upright'. Returns the offset now in use."""
+        """Record the current lean as 'upright' and, if a face has been seen, the
+        current head pose as 'looking straight ahead'. Returns the lean offset now in
+        use. The head part uses the most recent face mesh passed to solve(), so the
+        signature - and every existing caller - stays as it was."""
         self.torso_lean_offset_deg = self.measure_torso_lean_deg(raw_world_landmarks)
+        if self._last_face_rot is not None:
+            body_rot = self._body_rotation(raw_world_landmarks)  # with the new lean offset
+            if body_rot is not None:
+                self.head_neutral = body_rot.inv() * self._last_face_rot
+                self._head_rel = R.identity()
         return self.torso_lean_offset_deg
+
+    # -- head --------------------------------------------------------------------
+    def _face_mesh_rotation(self, face_landmarks: list[Any], image_size: tuple[int, int]) -> R | None:
+        """Head orientation in component space from the Holistic face mesh: the
+        rotation taking the rig's rest head axes (side=+X, fwd=+Y, up=+Z) onto the
+        face's. None if the mesh is missing or degenerate.
+
+        The mesh only exists image-normalised (x of width, y of height, z roughly in
+        x's units). Scaling x and z by width and y by height makes it metrically
+        consistent - measured on a real capture, z*1.0 keeps the face most rigid
+        across head turns (2.4% shape variation vs 3.5% at z*1.25, 4.2% at z*0.75).
+        It is then in the same camera-aligned axes as the pose world landmarks, so it
+        goes through the same conversion. Orthographic, which is fine for an object
+        the size of a head at performance distance.
+
+        Why the face mesh and not the pose model's own ear/eye/nose points (which are
+        metric already): on the same capture the pose points registered ~8 deg of a
+        ~37 deg head turn and 18 deg of pitch range vs the mesh's 72 - smooth, but
+        they barely move.
+        """
+        if not face_landmarks or len(face_landmarks) <= max(FACE_LEFT, FACE_RIGHT, FACE_CHIN):
+            return None
+        w, h = image_size
+
+        def pt(i: int) -> np.ndarray:
+            lm = face_landmarks[i]
+            # (Fwd, Right, Up) exactly as _convert_landmarks_to_ue_space, then to component.
+            return PTS_TO_COMPONENT @ np.array([-lm.z * w, -lm.x * w, -lm.y * h])
+
+        side = normalize((pt(FACE_LEFT) - pt(FACE_RIGHT)) + (pt(FACE_EYE_LEFT) - pt(FACE_EYE_RIGHT)))
+        up_hint = pt(FACE_TOP) - pt(FACE_CHIN)
+        up = normalize(up_hint - np.dot(up_hint, side) * side)
+        if np.linalg.norm(side) < 1e-6 or np.linalg.norm(up) < 1e-6:
+            return None
+        fwd = np.cross(up, side)  # Z x X = Y
+        return R.from_matrix(np.column_stack((side, fwd, up)))
 
     # -- rig rest pose, in component space -------------------------------------
     def _build_rest_pose(self) -> None:
@@ -487,23 +556,15 @@ class PoseSolver:
         return [BoneTransform(name=name, rotation=dict(BIND_POSES[i]), position=dict(BIND_POSITIONS[i]))
                 for i, name in enumerate(BONE_NAMES)]
 
-    def _solve_body_globals(
-        self, raw_world_landmarks: list[Any]
-    ) -> tuple[list[R], R, np.ndarray] | None:
-        """Shared by solve() and solve_hands(): computes every FULL_CHAIN
-        bone's global rotation, plus the whole-body orientation (body_rot)
-        and hip midpoint, from raw pose world landmarks. Returns None on the
-        same triggers solve() used to fall back to rest pose on (too few
-        landmarks, or a degenerate fwd/up) - each caller applies its own
-        fallback in that case. Pulled out of solve() so solve_hands() can
-        read hand_l/hand_r's global rotation from the exact same computation
-        solve() itself uses - not an independent approximation of it."""
+    def _body_rotation(self, raw_world_landmarks: list[Any]) -> R | None:
         if len(raw_world_landmarks) < len(PoseLandmark):
             return None
-
         pts = self._convert_landmarks_to_ue_space(raw_world_landmarks)
-        comp = {int(k): PTS_TO_COMPONENT @ pts[int(k)] for k in PoseLandmark}
+        return self._body_rotation_from_comp({int(k): PTS_TO_COMPONENT @ pts[int(k)] for k in PoseLandmark})
 
+    def _body_rotation_from_comp(self, comp: dict[int, np.ndarray]) -> R | None:
+        """Whole-body orientation (measured torso frame vs the rig's rest torso
+        frame), lean calibration applied. None if degenerate."""
         l_hip, r_hip = comp[int(_P.LEFT_HIP)], comp[int(_P.RIGHT_HIP)]
         l_sh, r_sh = comp[int(_P.LEFT_SHOULDER)], comp[int(_P.RIGHT_SHOULDER)]
         hip_mid = (l_hip + r_hip) * 0.5
@@ -523,7 +584,43 @@ class PoseSolver:
             right = normalize(np.cross(up, fwd))
 
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
-        body_rot = body_frame * self.rest_body_frame.inv()
+        return body_frame * self.rest_body_frame.inv()
+
+    def _solve_body_globals(
+        self,
+        raw_world_landmarks: list[Any],
+        face_landmarks: list[Any] | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> tuple[list[R], R, np.ndarray] | None:
+        """Shared by solve() and solve_hands(): computes every FULL_CHAIN
+        bone's global rotation, plus the whole-body orientation (body_rot)
+        and hip midpoint, from raw pose world landmarks. Returns None on the
+        same triggers solve() used to fall back to rest pose on (too few
+        landmarks, or a degenerate fwd/up) - each caller applies its own
+        fallback in that case. Pulled out of solve() so solve_hands() can
+        read hand_l/hand_r's global rotation from the exact same computation
+        solve() itself uses - not an independent approximation of it.
+
+        face_landmarks / image_size (Holistic face mesh, image-normalised, and the
+        capture size in pixels) drive neck_01/head. Without them the head keeps its
+        last torso-relative pose - welded to the chest until a face is first seen."""
+        if len(raw_world_landmarks) < len(PoseLandmark):
+            return None
+
+        pts = self._convert_landmarks_to_ue_space(raw_world_landmarks)
+        comp = {int(k): PTS_TO_COMPONENT @ pts[int(k)] for k in PoseLandmark}
+        body_rot = self._body_rotation_from_comp(comp)
+        if body_rot is None:
+            return None
+        hip_mid = (comp[int(_P.LEFT_HIP)] + comp[int(_P.RIGHT_HIP)]) * 0.5
+        shoulder_mid = (comp[int(_P.LEFT_SHOULDER)] + comp[int(_P.RIGHT_SHOULDER)]) * 0.5
+
+        if face_landmarks is not None and image_size is not None:
+            face_rot = self._face_mesh_rotation(face_landmarks, image_size)
+            if face_rot is not None:
+                self._last_face_rot = face_rot
+                self._head_rel = body_rot.inv() * face_rot * self.head_neutral.inv()
+        neck_rel = R.from_rotvec(self._head_rel.as_rotvec() * NECK_SHARE)
 
         n_full = len(FULL_CHAIN)
         global_rot: list[R] = [R.identity()] * n_full
@@ -532,6 +629,12 @@ class PoseSolver:
             parent = self.full_parent[i]
             if name in TORSO_BONES or name in INTERNAL_BONES:
                 global_rot[i] = body_rot * self.rest_global[i]
+            elif name == "neck_01":
+                global_rot[i] = body_rot * neck_rel * self.rest_global[i]
+            elif name == "head":
+                # The full head orientation regardless of the split: NECK_SHARE only
+                # moves the pivot, not where the face ends up pointing.
+                global_rot[i] = body_rot * self._head_rel * self.rest_global[i]
             elif name in self.rest_dir:
                 if name == "clavicle_l":
                     aim = comp[int(_P.LEFT_SHOULDER)] - shoulder_mid
@@ -547,8 +650,13 @@ class PoseSolver:
 
         return global_rot, body_rot, hip_mid
 
-    def solve(self, raw_world_landmarks: list[Any]) -> list[BoneTransform]:
-        solved = self._solve_body_globals(raw_world_landmarks)
+    def solve(
+        self,
+        raw_world_landmarks: list[Any],
+        face_landmarks: list[Any] | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> list[BoneTransform]:
+        solved = self._solve_body_globals(raw_world_landmarks, face_landmarks, image_size)
         if solved is None:
             return self._rest_pose_output()
         global_rot, _body_rot, hip_mid = solved

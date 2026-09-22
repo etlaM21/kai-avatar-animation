@@ -250,12 +250,12 @@ class Conductor:
         # Optional raw-landmark dump for offline solver checks (see
         # landmark_recorder.py / tests/solver_checks.py). None = no recording,
         # zero overhead.
+        # Capture size in pixels: the face mesh is image-normalised, and the head
+        # solve needs it to put x, y and z back in the same units.
+        self.frame_size = (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         self.recorder: LandmarkRecorder | None = None
         if record_path:
-            self.recorder = LandmarkRecorder(
-                record_path,
-                (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))),
-            )
+            self.recorder = LandmarkRecorder(record_path, self.frame_size)
 
         # The capture frame is deliberately large (MediaPipe crops its ROI from it,
         # so resolution helps detection at distance), but a 4K debug window is
@@ -355,10 +355,14 @@ class Conductor:
         packet = self.face_encoder.encode(smoothed)
         self.face_socket.sendto(packet, self.face_target)
  
-    def _handle_pose(self, frame: PoseFrame, timestamp_ms: int, hands_frame: HandsFrame) -> None:
+    def _handle_pose(self, frame: PoseFrame, timestamp_ms: int, hands_frame: HandsFrame,
+                     face_frame: FaceFrame | None = None) -> None:
         if frame.valid and len(frame.world_landmarks) > 0:
             # Get raw solved bones from MediaPipe
-            raw_bones = self.pose_solver.solve(frame.world_landmarks)
+            # The face mesh drives neck/head; without a face this frame the solver
+            # holds the last head pose relative to the torso.
+            face_lms = face_frame.landmarks if face_frame is not None and face_frame.valid else None
+            raw_bones = self.pose_solver.solve(frame.world_landmarks, face_lms, self.frame_size)
             self._last_valid_bone_transforms = raw_bones
             self._last_valid_world_landmarks = frame.world_landmarks
             present = True
@@ -540,7 +544,7 @@ class Conductor:
                 if self.recorder is not None:
                     self.recorder.add(ts, pose_frame, face_frame, hands_frame, head_pose_frame)
                 self._handle_face(face_frame)
-                self._handle_pose(pose_frame, ts, hands_frame)
+                self._handle_pose(pose_frame, ts, hands_frame, face_frame)
 
                 if self.show_debug:
                     key = self._draw_debug(raw_frame, face_frame, pose_frame, hands_frame)

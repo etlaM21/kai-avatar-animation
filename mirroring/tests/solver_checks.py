@@ -228,6 +228,31 @@ def synth_pose(solver: PoseSolver, anatomical: bool = False) -> list[Landmark]:
     return [comp_to_landmark(at[lm]) for lm in P]
 
 
+SYNTH_FRAME = (1920, 1080)
+
+
+def synth_face(solver: PoseSolver, turn: R | None = None) -> list[Landmark]:
+    """A 478-point face mesh (image-normalised, like Holistic's) whose basis points
+    describe a head looking along the rig's rest axes, optionally rotated by `turn`
+    (component space). Points the solver doesn't read sit at the head centre."""
+    from pose_solver import FACE_CHIN, FACE_EYE_LEFT, FACE_EYE_RIGHT, FACE_LEFT, FACE_RIGHT, FACE_TOP
+    turn = turn or R.identity()
+    w, h = SYNTH_FRAME
+    centre = solver.rest_pos[solver.full_idx["head"]] + np.array([0.0, 3.0, 8.0])
+    local = {FACE_LEFT: (7.0, 0.0, 0.0), FACE_RIGHT: (-7.0, 0.0, 0.0),
+             FACE_EYE_LEFT: (4.5, 7.0, 3.0), FACE_EYE_RIGHT: (-4.5, 7.0, 3.0),
+             FACE_TOP: (0.0, 6.0, 11.0), FACE_CHIN: (0.0, 6.0, -11.0)}
+
+    def to_image(p: np.ndarray) -> Landmark:
+        lm = comp_to_landmark(p)  # metres in MediaPipe axes; any uniform scale works
+        return Landmark(x=lm.x / w * 100.0, y=lm.y / h * 100.0, z=lm.z / w * 100.0)
+
+    pts = [to_image(centre)] * 478
+    for i, off in local.items():
+        pts[i] = to_image(centre + turn.apply(np.array(off)))
+    return pts
+
+
 def synth_hand_solver_consistent(solver: PoseSolver, side: str) -> list[Landmark]:
     """Landmarks walked out along the solver's OWN aim table (FINGER_AIM) and rest
     directions. Every aim pair then matches its bone's rest direction exactly, so all
@@ -283,6 +308,21 @@ def check_rest_identity(solver: PoseSolver, rep: Report) -> None:
            if (e := quat_angle_deg(b.rotation, solver.finger_bind_rot_dict[b.name])) > TOL_DEG]
     rep.check(not bad, f"fingers: {38 - len(bad)}/38 bones equal bind" + (f"  off: {', '.join(bad)}" if bad else ""))
 
+    face_solver = PoseSolver()
+    body = face_solver.solve(pose, synth_face(face_solver), SYNTH_FRAME)
+    bad = [f"{BONE_NAMES[i]} {e:.3f}deg" for i, b in enumerate(body)
+           if (e := quat_angle_deg(b.rotation, BIND_POSES[i])) > TOL_DEG]
+    rep.check(not bad, f"body + straight-ahead face mesh: {22 - len(bad)}/22 bones equal BIND_POSES"
+              + (f"  off: {', '.join(bad)}" if bad else ""))
+
+    # A turned head must come out as exactly that head orientation after Unreal-style
+    # FK (neck_02 held at bind under neck_01), whatever the neck/head split is.
+    turn = R.from_euler("zxy", [30.0, -15.0, 10.0], degrees=True)  # yaw, pitch, roll in component axes
+    g_rot, _ = fk_body(face_solver, face_solver.solve(pose, synth_face(face_solver, turn), SYNTH_FRAME))
+    hi = face_solver.full_idx["head"]
+    err = math.degrees((turn.inv() * g_rot["head"] * face_solver.rest_global[hi].inv()).magnitude())
+    rep.check(err < TOL_DEG, f"turned face mesh (yaw 30, pitch -15, roll 10) reproduced by head after FK ({err:.4f}deg)")
+
     print("\n1b. Rest pose at the rig's REAL joint positions (report - measures the landmark mapping)")
     body = solver.solve(synth_pose(solver, anatomical=True))
     errs = {BONE_NAMES[i]: quat_angle_deg(b.rotation, BIND_POSES[i]) for i, b in enumerate(body)}
@@ -325,9 +365,13 @@ def _stats(errs: list[float]) -> str:
     return f"{math.sqrt(float(np.mean(a ** 2))):6.2f} {float(np.max(a)):7.2f} {a.size:6d}"
 
 
-def check_capture(solver: PoseSolver, path: Path) -> dict[str, list[float]]:
+def check_capture(path: Path) -> dict[str, list[float]]:
     print(f"\n3. Absolute direction error - {path.name}")
+    # Fresh solver per recording: the head pose is held across face dropouts, and
+    # must not leak from one recording into the next.
+    solver = PoseSolver()  # torso_lean_offset 0: the torso row then measures the raw solve
     rec = load_recording(path)
+    frame_size = tuple(int(v) for v in rec["frame_size"])
     # recordings/trims.json cuts the walk to/from the laptop at either end.
     trims_file = path.parent / "trims.json"
     trim = json.loads(trims_file.read_text()).get(path.name) if trims_file.exists() else None
@@ -345,7 +389,8 @@ def check_capture(solver: PoseSolver, path: Path) -> dict[str, list[float]]:
         if not rec["pose_valid"][f]:
             continue
         pose = to_landmarks(rec["pose_world"][f])
-        body = solver.solve(pose)
+        face = to_landmarks(rec["face_image"][f]) if rec["face_valid"][f] else None
+        body = solver.solve(pose, face, frame_size)
         g_rot, g_pos = fk_body(solver, body)
         m = landmarks_to_comp(pose)
 
@@ -367,6 +412,18 @@ def check_capture(solver: PoseSolver, path: Path) -> dict[str, list[float]]:
         face_fwd = m[P.NOSE] - (m[P.LEFT_EAR] + m[P.RIGHT_EAR]) * 0.5
         flat = np.array([1.0, 1.0, 0.0])
         add("head_yaw", angle_deg(head_fwd * flat, face_fwd * flat))
+        head_delta = g_rot["head"] * solver.rest_global[solver.full_idx["head"]].inv()
+        if face:
+            # Plumbing: after Unreal-style FK (neck_02 at bind under neck_01) the head
+            # must point exactly where the face mesh says. Same source, so this checks
+            # the neck split / parenting, not the mesh's accuracy.
+            mesh = solver._face_mesh_rotation(face, frame_size)
+            add("head_vs_mesh", math.degrees((mesh.inv() * head_delta).magnitude()))
+        # How far the head turns relative to the torso - a range, not an error.
+        torso_delta = g_rot["spine_04"] * solver.rest_global[solver.full_idx["spine_04"]].inv()
+        rel_fwd = (torso_delta.inv() * head_delta).apply(np.array([0.0, 1.0, 0.0]))
+        add("head_rel_yaw", math.degrees(math.atan2(rel_fwd[0], rel_fwd[1])))
+        add("head_rel_pitch", math.degrees(math.asin(float(np.clip(rel_fwd[2], -1.0, 1.0)))))
 
         hands = {"_l": rec["lhand_world"][f] if rec["lhand_valid"][f] else None,
                  "_r": rec["rhand_world"][f] if rec["rhand_valid"][f] else None}
@@ -393,7 +450,11 @@ def check_capture(solver: PoseSolver, path: Path) -> dict[str, list[float]]:
         print(f"  {k:<22}{_stats(errs.get(k, []))}")
     body_all = [e for k in body_keys for e in errs.get(k, [])]
     print(f"  {'BODY overall':<22}{_stats(body_all)}")
-    print(f"  {'head_yaw':<22}{_stats(errs.get('head_yaw', []))}")
+    print(f"  {'head_yaw vs pose pts':<22}{_stats(errs.get('head_yaw', []))}   (pose ear->nose; under-reads turns)")
+    print(f"  {'head_vs_mesh':<22}{_stats(errs.get('head_vs_mesh', []))}")
+    for k in ("head_rel_yaw", "head_rel_pitch"):
+        a = np.array(errs[k])
+        print(f"  {k:<22}p5 {np.percentile(a, 5):6.1f}  p95 {np.percentile(a, 95):6.1f}  (range vs torso)")
     for k in sorted(k for k in errs if k.startswith("finger:")):
         print(f"  {k:<22}{_stats(errs[k])}")
     fing_all = [e for k in errs if k.startswith("finger:") for e in errs[k]]
@@ -408,7 +469,7 @@ def main() -> int:
     ap.add_argument("recordings", nargs="*", type=Path)
     args = ap.parse_args()
 
-    solver = PoseSolver()  # torso_lean_offset 0: the torso row then measures the raw solve
+    solver = PoseSolver()
     rep = Report()
     check_rest_identity(solver, rep)
     check_bind_fk(solver, rep)
@@ -417,7 +478,7 @@ def main() -> int:
     if not recs:
         print("\n3. Absolute direction error - SKIPPED (no recordings; pass a .npz or add recordings/*.npz)")
     for path in recs:
-        check_capture(solver, path)
+        check_capture(path)
 
     print(f"\n{'ALL PASS' if not rep.failures else f'{rep.failures} FAILURE(S)'} (checks 1-2; check 3 is a report)")
     return 1 if rep.failures else 0

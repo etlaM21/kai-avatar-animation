@@ -254,11 +254,22 @@ retargeting). Taking it further to a MetaHuman is still just a plan:
 
 - **Face**: HolisticLandmarker blendshapes + a second slim FaceLandmarker pass
   for head yaw/pitch/roll (HolisticLandmarkerResult has no transformation-matrix
-  equivalent) → Epic's stock Live Link Face plugin. Working.
+  equivalent) → Epic's stock Live Link Face plugin. **Caveat, measured:** at
+  full-body distance (1080p, performer ~full frame height) that standalone
+  FaceLandmarker never detects the face - in both recordings it only fired
+  while walking up to the laptop - so Live Link Face's head rotation stays at
+  its initial zero during a performance. Blendshapes (from Holistic) are fine.
 - **Body**: `pose_solver.py`'s `solve()` - per-bone minimal-swing rotation
   from rest direction to measured direction, converted to parent-local in
   Unreal's component space. 22 bones, verified against three acceptance tests
   (see CLAUDE.md).
+- **Head (body stream)**: `neck_01`/`head` get a full orientation (yaw, pitch
+  and roll) from the Holistic face mesh (cheek extremes + eye corners for the
+  side axis, forehead→chin for up), split 40/60 between neck and head, held
+  across face dropouts. "Calibrate upright" also records the neutral head pose.
+  Chosen over the pose model's own ear/nose points by measurement: those caught
+  ~8° of a ~37° head turn. Which lane should own head rotation in UE (body
+  stream vs Live Link Face) is still open.
 - **Fingers**: `pose_solver.py`'s `solve_hands()` - the identical technique
   extended one layer past hand_l/hand_r, verified against a real
   `RefSkeleton` dump of Manny's finger rig (19 bones/hand: metacarpal + 3
