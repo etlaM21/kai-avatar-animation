@@ -1,0 +1,5 @@
+{
+  "_comment": "Usable window per recording, in conductor t_ms. The performer walks to/from the laptop to start/stop recording; frames outside these windows are that walk, not performance. Cut points found from image-space shoulder width (rises as the performer approaches the camera), with ~1 s margin.",
+  "rest.npz":   {"start_ms": 3000, "end_ms": 12800},
+  "motion.npz": {"start_ms": 3000, "end_ms": 21400}
+}

@@ -25,6 +25,7 @@ independently, so a mis-mapped bone shows up as error.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -327,6 +328,13 @@ def _stats(errs: list[float]) -> str:
 def check_capture(solver: PoseSolver, path: Path) -> dict[str, list[float]]:
     print(f"\n3. Absolute direction error - {path.name}")
     rec = load_recording(path)
+    # recordings/trims.json cuts the walk to/from the laptop at either end.
+    trims_file = path.parent / "trims.json"
+    trim = json.loads(trims_file.read_text()).get(path.name) if trims_file.exists() else None
+    if trim:
+        keep = (rec["t_ms"] >= trim["start_ms"]) & (rec["t_ms"] <= trim["end_ms"])
+        rec = {k: (v[keep] if v.ndim and len(v) == len(keep) else v) for k, v in rec.items()}
+        print(f"  trimmed to {trim['start_ms']}-{trim['end_ms']} ms (recordings/trims.json)")
     errs: dict[str, list[float]] = {}
     add = lambda k, v: errs.setdefault(k, []).append(v)  # noqa: E731
     palm_local = {s: rest_palm_normal_local(solver, s) for s in ("_l", "_r")}
