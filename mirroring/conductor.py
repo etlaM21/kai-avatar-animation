@@ -68,6 +68,7 @@ from mediapipe_pose_osc_protocol import (
 )
 from pose_solver import BoneTransform, PoseSolver
 from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder
+from landmark_recorder import LandmarkRecorder
 
 # Tasks-API drawing helpers. The legacy mp.solutions namespace (and
 # mediapipe.framework.formats.landmark_pb2 with it) no longer exists in current
@@ -234,6 +235,7 @@ class Conductor:
         face_smoothing_alpha: float = 0.5,
         pose_smoothing_alpha: float = 0.5,
         show_debug: bool = False,
+        record_path: str | None = None,
     ) -> None:
         self.holistic_capture = holistic_capture
         self.head_pose_capture = head_pose_capture
@@ -244,6 +246,16 @@ class Conductor:
  
         # --- the one shared camera, opened exactly once ---
         self.cap = open_camera(camera_index, camera_width, camera_height)
+
+        # Optional raw-landmark dump for offline solver checks (see
+        # landmark_recorder.py / tests/solver_checks.py). None = no recording,
+        # zero overhead.
+        self.recorder: LandmarkRecorder | None = None
+        if record_path:
+            self.recorder = LandmarkRecorder(
+                record_path,
+                (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+            )
 
         # The capture frame is deliberately large (MediaPipe crops its ROI from it,
         # so resolution helps detection at distance), but a 4K debug window is
@@ -525,6 +537,8 @@ class Conductor:
                     face_frame.head_yaw_deg = head_pose_frame.yaw_deg
                     face_frame.head_pitch_deg = head_pose_frame.pitch_deg
                     face_frame.head_roll_deg = head_pose_frame.roll_deg
+                if self.recorder is not None:
+                    self.recorder.add(ts, pose_frame, face_frame, hands_frame, head_pose_frame)
                 self._handle_face(face_frame)
                 self._handle_pose(pose_frame, ts, hands_frame)
 
@@ -538,6 +552,8 @@ class Conductor:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.recorder is not None:
+                self.recorder.save()
             self.cap.release()
             self.holistic_capture.close()
             self.head_pose_capture.close()
@@ -569,6 +585,9 @@ def main() -> None:
                          help="EMA alpha for face, 0-1. Lower = smoother but laggier.")
     parser.add_argument("--pose-smoothing", type=float, default=0.5,
                          help="EMA alpha for pose, 0-1. Lower = smoother but laggier.")
+    parser.add_argument("--record", default=None, metavar="FILE.npz",
+                         help="dump raw landmarks of this session to FILE.npz on exit, "
+                              "for offline solver checks (tests/solver_checks.py)")
     parser.add_argument("--debug", action="store_true",
                          help="show a combined webcam + tracking-status debug window")
     args = parser.parse_args()
@@ -594,6 +613,7 @@ def main() -> None:
         face_smoothing_alpha=args.face_smoothing,
         pose_smoothing_alpha=args.pose_smoothing,
         show_debug=args.debug,
+        record_path=args.record,
     )
     conductor.run()
  

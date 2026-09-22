@@ -87,6 +87,20 @@ Needs `holistic_landmarker.task` and `face_landmarker.task` next to
 nothing loads it any more. In the debug window, press `c` while standing
 upright to calibrate away MediaPipe's ~18° forward-lean bias, `Esc` to quit.
 
+### Recording + offline solver checks
+
+```powershell
+.\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\rest.npz
+.\venv\Scripts\python.exe tests\solver_checks.py              # runs on every recordings\*.npz
+```
+
+`--record` dumps the raw (pre-solve, pre-smoothing) landmarks of the session on
+exit (`landmark_recorder.py`). `tests/solver_checks.py` needs no camera: rest-pose
+identity and bind-pose FK are asserted; absolute per-bone direction error on each
+recording is reported. Ground truth there uses an anatomical MediaPipe→Manny
+joint mapping defined independently of the solver's own aim tables, so a
+mis-mapped bone shows up as error instead of passing by construction.
+
 Or drive the same pipeline from a GUI instead of the terminal:
 
 ```powershell
