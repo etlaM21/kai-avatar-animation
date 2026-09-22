@@ -243,6 +243,12 @@ NECK_SHARE = 0.4
 # performer's LEFT - it lies on the image's right), eye outer corners to stabilise
 # it, forehead top (10) and chin (152) for the up axis. The chin moves a little with
 # jaw opening; eye->mouth would move with every smile.
+# Share of the wrist's twist handed back to the forearm. MediaPipe can't observe
+# pronation from joint positions, but the palm plane can - without this the whole
+# roll lands on the wrist joint and the forearm stays unrotated. 0.5 is a visual
+# choice; 0.0 disables the redistribution entirely.
+FOREARM_TWIST_SHARE = 0.5
+
 FACE_LEFT, FACE_RIGHT = 454, 234
 FACE_EYE_LEFT, FACE_EYE_RIGHT = 263, 33
 FACE_TOP, FACE_CHIN = 10, 152
@@ -335,11 +341,17 @@ FINGER_BONE_NAMES: list[str] = [c[0] for c in FINGER_CHAIN]
 # that actually drive curl and splay - solves to 0.000 deg in the bind-pose
 # round-trip test. Not fixable without estimating the missing offset from
 # something other than measurement, i.e. guessing again.
+#
+# The thumb used to be mapped one joint further in (WRIST->CMC, CMC->MCP,
+# MCP->IP), which sheared the whole thumb: Manny's thumb_01 IS the thumb
+# metacarpal, so it runs CMC->MCP, not WRIST->CMC. Measured at 18-32 deg RMS
+# error per thumb bone on a real capture - even with the performer's hands at
+# rest - against the anatomical mapping in tests/solver_checks.py.
 _HL = HandLandmark
 FINGER_AIM_L: dict[str, tuple] = {
-    "thumb_01_l": (_HL.WRIST, _HL.THUMB_CMC),
-    "thumb_02_l": (_HL.THUMB_CMC, _HL.THUMB_MCP),
-    "thumb_03_l": (_HL.THUMB_MCP, _HL.THUMB_IP),
+    "thumb_01_l": (_HL.THUMB_CMC, _HL.THUMB_MCP),
+    "thumb_02_l": (_HL.THUMB_MCP, _HL.THUMB_IP),
+    "thumb_03_l": (_HL.THUMB_IP, _HL.THUMB_TIP),
 
     "index_metacarpal_l": (_HL.WRIST, _HL.INDEX_FINGER_MCP),
     "index_01_l": (_HL.INDEX_FINGER_MCP, _HL.INDEX_FINGER_PIP),
@@ -387,8 +399,12 @@ class PoseSolver:
         # a few degrees, people carry their heads differently). Identity = mesh as-is.
         self.head_neutral = R.identity()
         self._last_face_rot: R | None = None
+        # Per-hand rotation from the rig's rest hand to the measured one, set by
+        # _solve_body_globals() and read by solve_hands() so both agree on the wrist.
+        self._hand_delta: dict[str, R | None] = {"_l": None, "_r": None}
         self._build_rest_pose()
         self._build_finger_rest_pose()
+        self._build_hand_frames()
 
     def measure_torso_lean_deg(self, raw_world_landmarks: list[Any]) -> float:
         """Forward lean of the torso as MediaPipe reports it. Positive = leaning forward."""
@@ -538,6 +554,46 @@ class PoseSolver:
                 axis = np.array([1.0, 0.0, 0.0]) if name.endswith("_l") else np.array([-1.0, 0.0, 0.0])
                 self.finger_rest_dir[name] = normalize(self.finger_rest_global[name].apply(axis))
 
+    # -- hand orientation from the palm plane ---------------------------------
+    @staticmethod
+    def _palm_frame(wrist: np.ndarray, index_mcp: np.ndarray, middle_mcp: np.ndarray,
+                    pinky_mcp: np.ndarray) -> R | None:
+        """Orthonormal frame of a hand: along the fingers, across the palm, and the
+        palm normal. Built identically from rig rest positions and from measured
+        landmarks, so any constant geometric offset between the two cancels out.
+
+        This is what makes the hand's ROLL observable. A swing-only aim leaves
+        rotation about the bone axis free, so the fingers inherited the torso's roll
+        and looked twisted; three non-collinear palm points pin it down.
+        """
+        fwd = normalize(middle_mcp - wrist)
+        normal = np.cross(index_mcp - wrist, pinky_mcp - wrist)
+        normal = normalize(normal - np.dot(normal, fwd) * fwd)
+        if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(normal) < 1e-6:
+            return None
+        return R.from_matrix(np.column_stack((fwd, normal, np.cross(fwd, normal))))
+
+    def _build_hand_frames(self) -> None:
+        self.hand_rest_frame: dict[str, R] = {}
+        for side in ("_l", "_r"):
+            frame = self._palm_frame(self.finger_rest_pos[f"hand{side}"],
+                                     self.finger_rest_pos[f"index_01{side}"],
+                                     self.finger_rest_pos[f"middle_01{side}"],
+                                     self.finger_rest_pos[f"pinky_01{side}"])
+            assert frame is not None, f"degenerate rest palm frame for hand{side}"
+            self.hand_rest_frame[side] = frame
+
+    def _hand_rotation(self, raw_hand_world_landmarks: list[Any], side: str) -> R | None:
+        """World rotation taking the rig's rest hand onto the measured one. None if
+        that hand isn't tracked this frame."""
+        if not raw_hand_world_landmarks or len(raw_hand_world_landmarks) < 21:
+            return None
+        pts = self._convert_landmarks_to_ue_space(raw_hand_world_landmarks)
+        comp = {i: PTS_TO_COMPONENT @ pts[i] for i in range(len(pts))}
+        frame = self._palm_frame(comp[int(_HL.WRIST)], comp[int(_HL.INDEX_FINGER_MCP)],
+                                 comp[int(_HL.MIDDLE_FINGER_MCP)], comp[int(_HL.PINKY_MCP)])
+        return None if frame is None else frame * self.hand_rest_frame[side].inv()
+
     # -- landmark conversion ---------------------------------------------------
     def _convert_landmarks_to_ue_space(self, raw_landmarks: list[Any]) -> np.ndarray:
         """MediaPipe world landmarks -> (Fwd, Right, Up) in centimetres.
@@ -586,11 +642,22 @@ class PoseSolver:
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
         return body_frame * self.rest_body_frame.inv()
 
+    @staticmethod
+    def _twist_about(rot: R, axis: np.ndarray) -> R:
+        """The part of `rot` that spins about `axis` (swing-twist decomposition)."""
+        q = rot.as_quat()  # x, y, z, w
+        proj = np.dot(q[:3], axis) * axis
+        twist = np.array([proj[0], proj[1], proj[2], q[3]])
+        norm = np.linalg.norm(twist)
+        return R.identity() if norm < 1e-8 else R.from_quat(twist / norm)
+
     def _solve_body_globals(
         self,
         raw_world_landmarks: list[Any],
         face_landmarks: list[Any] | None = None,
         image_size: tuple[int, int] | None = None,
+        left_hand_world_landmarks: list[Any] | None = None,
+        right_hand_world_landmarks: list[Any] | None = None,
     ) -> tuple[list[R], R, np.ndarray] | None:
         """Shared by solve() and solve_hands(): computes every FULL_CHAIN
         bone's global rotation, plus the whole-body orientation (body_rot)
@@ -648,6 +715,37 @@ class PoseSolver:
             else:
                 global_rot[i] = global_rot[parent] * self.full_bind[i]
 
+        # Hands, once the arm chain above is solved: a full palm basis replaces the
+        # swing aimed at the pose model's INDEX point, which is both roll-free and
+        # ~17 deg off the hand bone's own axis. Falls back to that aim per hand when
+        # the 21-point hand isn't tracked.
+        self._hand_delta = {
+            "_l": self._hand_rotation(left_hand_world_landmarks or [], "_l"),
+            "_r": self._hand_rotation(right_hand_world_landmarks or [], "_r"),
+        }
+        for side in ("_l", "_r"):
+            delta = self._hand_delta[side]
+            if delta is None:
+                continue
+            hand_i = self.full_idx[f"hand{side}"]
+            lower_i = self.full_idx[f"lowerarm{side}"]
+            global_rot[hand_i] = delta * self.rest_global[hand_i]
+            # MediaPipe can't see forearm pronation (joint positions only), but the
+            # palm now can: pass a share of the wrist's twist back up the forearm so
+            # the roll comes from the arm rather than snapping at the wrist. The
+            # hand's own global orientation is unchanged by this - only the pivot.
+            #
+            # Measured against where the forearm WOULD carry the hand at bind, not
+            # against the forearm itself: hand_l's bind local already contains a
+            # -67.8 deg roll, and treating that as twist tipped the whole arm by 34 deg.
+            if FOREARM_TWIST_SHARE > 0.0:
+                carried = global_rot[lower_i] * self.full_bind[hand_i]
+                residual = global_rot[hand_i] * carried.inv()
+                axis = normalize(global_rot[lower_i].apply(
+                    np.array([1.0, 0.0, 0.0]) if side == "_l" else np.array([-1.0, 0.0, 0.0])))
+                twist = self._twist_about(residual, axis)
+                global_rot[lower_i] = R.from_rotvec(twist.as_rotvec() * FOREARM_TWIST_SHARE) * global_rot[lower_i]
+
         return global_rot, body_rot, hip_mid
 
     def solve(
@@ -655,8 +753,11 @@ class PoseSolver:
         raw_world_landmarks: list[Any],
         face_landmarks: list[Any] | None = None,
         image_size: tuple[int, int] | None = None,
+        left_hand_world_landmarks: list[Any] | None = None,
+        right_hand_world_landmarks: list[Any] | None = None,
     ) -> list[BoneTransform]:
-        solved = self._solve_body_globals(raw_world_landmarks, face_landmarks, image_size)
+        solved = self._solve_body_globals(raw_world_landmarks, face_landmarks, image_size,
+                                          left_hand_world_landmarks, right_hand_world_landmarks)
         if solved is None:
             return self._rest_pose_output()
         global_rot, _body_rot, hip_mid = solved
@@ -693,11 +794,16 @@ class PoseSolver:
         self,
         side_suffix: str,
         raw_hand_world_landmarks: list[Any],
-        body_rot: R | None,
+        hand_delta: R | None,
         root_global: R | None,
     ) -> list[BoneTransform]:
+        """hand_delta is the rotation from the rig's rest hand to the measured one
+        (see _hand_rotation) - the frame every finger's rest direction is carried
+        into. It used to be body_rot, the TORSO's rotation, which meant the fingers
+        inherited the chest's roll instead of the wrist's: turn the wrist over and
+        the fingers kept pointing the old way, which is what read as 'clawed'."""
         names = [n for n in FINGER_BONE_NAMES if n.endswith(side_suffix)]
-        if body_rot is None or root_global is None or len(raw_hand_world_landmarks) < 21:
+        if hand_delta is None or root_global is None or len(raw_hand_world_landmarks) < 21:
             return [self._rest_finger_bone(name) for name in names]
 
         pts = self._convert_landmarks_to_ue_space(raw_hand_world_landmarks)
@@ -707,8 +813,8 @@ class PoseSolver:
         for name in names:
             a, b = FINGER_AIM[name]
             aim = comp[int(b)] - comp[int(a)]
-            rest_world = body_rot.apply(self.finger_rest_dir[name])
-            global_rot[name] = swing_between(rest_world, aim) * body_rot * self.finger_rest_global[name]
+            rest_world = hand_delta.apply(self.finger_rest_dir[name])
+            global_rot[name] = swing_between(rest_world, aim) * hand_delta * self.finger_rest_global[name]
 
         result: list[BoneTransform] = []
         for name in names:
@@ -737,16 +843,20 @@ class PoseSolver:
         comes straight out of _solve_body_globals(), the same computation
         solve() uses for the streamed body bones - so finger parent-local
         rotations always compose against the value actually being sent to
-        Unreal for that bone this frame."""
-        solved = self._solve_body_globals(pose_world_landmarks)
+        Unreal for that bone this frame - including the palm-plane orientation,
+        since the same hand landmarks are passed through to it here."""
+        solved = self._solve_body_globals(pose_world_landmarks, None, None,
+                                          left_hand_world_landmarks, right_hand_world_landmarks)
         if solved is None:
-            body_rot, hand_l_global, hand_r_global = None, None, None
+            hand_delta = {"_l": None, "_r": None}
+            hand_l_global = hand_r_global = None
         else:
-            global_rot, body_rot, _hip_mid = solved
+            global_rot, _body_rot, _hip_mid = solved
             fi = self.full_idx
+            hand_delta = self._hand_delta
             hand_l_global = global_rot[fi["hand_l"]]
             hand_r_global = global_rot[fi["hand_r"]]
 
-        left = self._solve_one_hand("_l", left_hand_world_landmarks, body_rot, hand_l_global)
-        right = self._solve_one_hand("_r", right_hand_world_landmarks, body_rot, hand_r_global)
+        left = self._solve_one_hand("_l", left_hand_world_landmarks, hand_delta["_l"], hand_l_global)
+        right = self._solve_one_hand("_r", right_hand_world_landmarks, hand_delta["_r"], hand_r_global)
         return left, right

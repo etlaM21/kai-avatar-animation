@@ -270,6 +270,14 @@ retargeting). Taking it further to a MetaHuman is still just a plan:
   Chosen over the pose model's own ear/nose points by measurement: those caught
   ~8° of a ~37° head turn. Which lane should own head rotation in UE (body
   stream vs Live Link Face) is still open.
+- **Hands (wrist orientation)**: `hand_l`/`hand_r` come from a full palm basis
+  (wrist→middle MCP, plus the palm normal from the index/pinky MCPs), built with
+  the identical formula from the rig's rest hand so geometric offsets cancel.
+  This is what makes wrist ROLL observable at all - a swing aim leaves rotation
+  about the bone axis free, and the fingers were inheriting the torso's roll.
+  Half the wrist's twist is passed back to `lowerarm_*`, so pronation comes from
+  the forearm instead of snapping at the wrist (`FOREARM_TWIST_SHARE`). Falls
+  back to the old pose-INDEX aim per hand when that hand isn't tracked.
 - **Fingers**: `pose_solver.py`'s `solve_hands()` - the identical technique
   extended one layer past hand_l/hand_r, verified against a real
   `RefSkeleton` dump of Manny's finger rig (19 bones/hand: metacarpal + 3

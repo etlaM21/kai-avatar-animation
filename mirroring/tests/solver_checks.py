@@ -295,18 +295,48 @@ class Report:
 
 
 def check_rest_identity(solver: PoseSolver, rep: Report) -> None:
-    print("\n1a. Rest-pose identity (landmarks along the solver's own aim table - must be exact)")
+    print("\n1a. Rest-pose identity (rig's own bind pose in, bind pose out)")
     pose = synth_pose(solver)
-    body = solver.solve(pose)
+    hands = {s: synth_hand(solver, s) for s in ("_l", "_r")}
+    body = solver.solve(pose, None, None, hands["_l"], hands["_r"])
     errs = [quat_angle_deg(b.rotation, BIND_POSES[i]) for i, b in enumerate(body)]
     bad = [f"{BONE_NAMES[i]} {e:.3f}deg" for i, e in enumerate(errs) if e > TOL_DEG]
     rep.check(not bad, f"body: {22 - len(bad)}/22 bones equal BIND_POSES" + (f"  off: {', '.join(bad)}" if bad else ""))
 
-    left, right = solver.solve_hands(pose, synth_hand_solver_consistent(solver, "_l"),
-                                     synth_hand_solver_consistent(solver, "_r"))
-    bad = [f"{b.name} {e:.3f}deg" for b in left + right
-           if (e := quat_angle_deg(b.rotation, solver.finger_bind_rot_dict[b.name])) > TOL_DEG]
-    rep.check(not bad, f"fingers: {38 - len(bad)}/38 bones equal bind" + (f"  off: {', '.join(bad)}" if bad else ""))
+    left, right = solver.solve_hands(pose, hands["_l"], hands["_r"])
+    # Compared as GLOBAL orientation, not parent-local: a metacarpal's known aim
+    # approximation (below) lands in its child's local rotation while the child still
+    # points exactly where it should, and locals would report that as the child's error.
+    g_rot, g_pos = fk_body(solver, body)
+    got: dict[str, float] = {}
+    for side, fb in (("_l", left), ("_r", right)):
+        fr, _ = fk_hand(solver, side, g_rot[f"hand{side}"], g_pos[f"hand{side}"], fb)
+        for b in fb:
+            got[b.name] = math.degrees((solver.finger_rest_global[b.name].inv() * fr[b.name]).magnitude())
+    bad = [f"{n} {e:.3f}deg" for n, e in got.items() if "metacarpal" not in n and e > TOL_DEG]
+    n_exact = sum(1 for n in got if "metacarpal" not in n)
+    rep.check(not bad, f"fingers: {n_exact - len(bad)}/{n_exact} phalanges + thumb bones at rest orientation"
+              + (f"  off: {', '.join(bad)}" if bad else ""))
+    # Metacarpals are the one disclosed approximation: MediaPipe has no landmark at
+    # a metacarpal's base, so they are aimed WRIST->MCP (see pose_solver.py).
+    worst = max(e for n, e in got.items() if "metacarpal" in n)
+    rep.check(worst < 15.0, f"fingers: metacarpals within 15deg of rest (max {worst:.2f}deg, "
+              "known WRIST->MCP approximation)")
+
+    # Wrist roll: rolling the measured hand about the forearm must come back out of
+    # the rig, which a swing-only hand aim could not do at all.
+    for deg in (45.0, -60.0):
+        rolled = PoseSolver()
+        axis = np.array([1.0, 0.0, 0.0])
+        roll = R.from_rotvec(axis * math.radians(deg))
+        centre = rolled.finger_rest_pos["hand_l"]
+        rolled_lms = [comp_to_landmark(centre + roll.apply(landmarks_to_comp([lm])[0] - centre))
+                      for lm in hands["_l"]]
+        out = rolled.solve(pose, None, None, rolled_lms, None)
+        g_rot, _ = fk_body(rolled, out)
+        got = g_rot["hand_l"] * rolled.rest_global[rolled.full_idx["hand_l"]].inv()
+        err = math.degrees((roll.inv() * got).magnitude())
+        rep.check(err < TOL_DEG, f"hand_l roll {deg:+.0f}deg about the forearm reproduced ({err:.4f}deg)")
 
     face_solver = PoseSolver()
     body = face_solver.solve(pose, synth_face(face_solver), SYNTH_FRAME)
@@ -390,7 +420,9 @@ def check_capture(path: Path) -> dict[str, list[float]]:
             continue
         pose = to_landmarks(rec["pose_world"][f])
         face = to_landmarks(rec["face_image"][f]) if rec["face_valid"][f] else None
-        body = solver.solve(pose, face, frame_size)
+        lh = to_landmarks(rec["lhand_world"][f]) if rec["lhand_valid"][f] else None
+        rh = to_landmarks(rec["rhand_world"][f]) if rec["rhand_valid"][f] else None
+        body = solver.solve(pose, face, frame_size, lh, rh)
         g_rot, g_pos = fk_body(solver, body)
         m = landmarks_to_comp(pose)
 
@@ -425,14 +457,12 @@ def check_capture(path: Path) -> dict[str, list[float]]:
         add("head_rel_yaw", math.degrees(math.atan2(rel_fwd[0], rel_fwd[1])))
         add("head_rel_pitch", math.degrees(math.asin(float(np.clip(rel_fwd[2], -1.0, 1.0)))))
 
-        hands = {"_l": rec["lhand_world"][f] if rec["lhand_valid"][f] else None,
-                 "_r": rec["rhand_world"][f] if rec["rhand_valid"][f] else None}
-        left, right = solver.solve_hands(pose, to_landmarks(rec["lhand_world"][f]) if hands["_l"] is not None else [],
-                                         to_landmarks(rec["rhand_world"][f]) if hands["_r"] is not None else [])
+        hands = {"_l": lh, "_r": rh}
+        left, right = solver.solve_hands(pose, lh or [], rh or [])
         for side, fb in (("_l", left), ("_r", right)):
             if hands[side] is None:
                 continue
-            hm = landmarks_to_comp(to_landmarks(hands[side]))
+            hm = landmarks_to_comp(hands[side])
             fr, fp = fk_hand(solver, side, g_rot[f"hand{side}"], g_pos[f"hand{side}"], fb)
             for bone, (a, b) in FINGER_TRUTH.items():
                 name = f"{bone}{side}"
@@ -441,6 +471,14 @@ def check_capture(path: Path) -> dict[str, list[float]]:
                 add(f"finger:{bone}", angle_deg(rig_dir, hm[int(b)] - hm[int(a)]))
             n_meas = np.cross(hm[int(H.INDEX_FINGER_MCP)] - hm[int(H.WRIST)], hm[int(H.PINKY_MCP)] - hm[int(H.WRIST)])
             add(f"palm_normal{side}", angle_deg(g_rot[f"hand{side}"].apply(palm_local[side]), n_meas))
+            # How far the two MODELS disagree about the same joint. The hand_l/hand_r
+            # rows above are measured against the pose model's INDEX point, so they
+            # can never be smaller than this - it is the floor on that comparison,
+            # not solver error.
+            pose_index = P.LEFT_INDEX if side == "_l" else P.RIGHT_INDEX
+            pose_wrist = P.LEFT_WRIST if side == "_l" else P.RIGHT_WRIST
+            add("pose_vs_hand_model", angle_deg(m[pose_index] - m[pose_wrist],
+                                                hm[int(H.INDEX_FINGER_MCP)] - hm[int(H.WRIST)]))
 
     body_keys = [b for b, *_ in BODY_TRUTH] + ["hand_l", "hand_r", "clavicle_l", "clavicle_r", "torso"]
     print(f"  {sum(rec['pose_valid'])}/{n} frames with pose, "
@@ -450,6 +488,8 @@ def check_capture(path: Path) -> dict[str, list[float]]:
         print(f"  {k:<22}{_stats(errs.get(k, []))}")
     body_all = [e for k in body_keys for e in errs.get(k, [])]
     print(f"  {'BODY overall':<22}{_stats(body_all)}")
+    print(f"  {'(pose vs hand model)':<22}{_stats(errs.get('pose_vs_hand_model', []))}   "
+          f"floor on the hand_l/hand_r rows")
     print(f"  {'head_yaw vs pose pts':<22}{_stats(errs.get('head_yaw', []))}   (pose ear->nose; under-reads turns)")
     print(f"  {'head_vs_mesh':<22}{_stats(errs.get('head_vs_mesh', []))}")
     for k in ("head_rel_yaw", "head_rel_pitch"):

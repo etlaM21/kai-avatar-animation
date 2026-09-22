@@ -362,7 +362,14 @@ class Conductor:
             # The face mesh drives neck/head; without a face this frame the solver
             # holds the last head pose relative to the torso.
             face_lms = face_frame.landmarks if face_frame is not None and face_frame.valid else None
-            raw_bones = self.pose_solver.solve(frame.world_landmarks, face_lms, self.frame_size)
+            # The hands go in here too, not just into solve_hands(): hand_l/hand_r are
+            # BODY bones, and their orientation now comes from the palm plane. Passing
+            # the same landmarks to both keeps the wrist and the fingers consistent.
+            raw_bones = self.pose_solver.solve(
+                frame.world_landmarks, face_lms, self.frame_size,
+                hands_frame.left.world_landmarks if hands_frame.left.valid else None,
+                hands_frame.right.world_landmarks if hands_frame.right.valid else None,
+            )
             self._last_valid_bone_transforms = raw_bones
             self._last_valid_world_landmarks = frame.world_landmarks
             present = True
