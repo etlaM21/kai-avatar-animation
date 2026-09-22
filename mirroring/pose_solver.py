@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import math
+import time
 from mediapipe.tasks.python.vision import hand_landmarker
 from mediapipe_pose_capture import PoseLandmark
 
@@ -44,6 +45,17 @@ BONE_NAMES: list[str] = [
 BONE_PARENTS: list[int] = [
     -1, 0, 1, 2, 3, 4, 3, 6, 7, 8, 3, 10, 11, 12, 0, 14, 15, 16, 0, 18, 19, 20
 ]
+
+
+@dataclass
+class CalibrationState:
+    """What a running timed calibration is doing right now, for the debug overlay
+    and the GUI. phase is 'idle', 'countdown', 'sampling' or 'done'."""
+    phase: str
+    seconds_left: float
+    samples: int
+    samples_wanted: int
+    lean_offset_deg: float
 
 
 @dataclass
@@ -402,19 +414,86 @@ class PoseSolver:
         # Per-hand rotation from the rig's rest hand to the measured one, set by
         # _solve_body_globals() and read by solve_hands() so both agree on the wrist.
         self._hand_delta: dict[str, R | None] = {"_l": None, "_r": None}
+        # Running timed calibration, or None. See begin_calibration().
+        self._cal: dict[str, Any] | None = None
         self._build_rest_pose()
         self._build_finger_rest_pose()
         self._build_hand_frames()
 
     def measure_torso_lean_deg(self, raw_world_landmarks: list[Any]) -> float:
-        """Forward lean of the torso as MediaPipe reports it. Positive = leaning forward."""
+        """Forward lean of the performer's torso RELATIVE TO THE RIG'S OWN rest torso.
+        Positive = leaning further forward than Manny stands. Zero means the torso
+        already matches the rig, which is exactly when body_rot comes out as identity.
+
+        Measured against vertical instead (as this did originally), a calibration on a
+        genuinely upright performer still cancels Manny's own 5.8 deg backward torso
+        lean, leaving the character 5.8 deg off its bind pose at the performer's
+        neutral. Caught by the synthetic calibration check: calibrating on the rig's
+        own rest pose has to be a no-op, and wasn't."""
         if len(raw_world_landmarks) < len(PoseLandmark):
             return 0.0
         pts = self._convert_landmarks_to_ue_space(raw_world_landmarks)
         hip_mid = (pts[int(_P.LEFT_HIP)] + pts[int(_P.RIGHT_HIP)]) * 0.5
         shoulder_mid = (pts[int(_P.LEFT_SHOULDER)] + pts[int(_P.RIGHT_SHOULDER)]) * 0.5
         up = normalize(shoulder_mid - hip_mid)
-        return math.degrees(math.atan2(float(up[0]), float(up[2])))
+        return math.degrees(math.atan2(float(up[0]), float(up[2]))) - self.rest_lean_deg
+
+    # -- timed calibration -------------------------------------------------------
+    def begin_calibration(self, countdown_s: float = 3.0, samples: int = 30,
+                          now_s: float | None = None) -> None:
+        """Start a countdown, then average the neutral pose over `samples` frames.
+
+        Averaging matters: the lean measurement is noisy frame to frame, and a single
+        snapshot bakes in whatever jitter existed at that instant. The countdown is
+        what lets the performer get back into position and stand still first."""
+        self._cal = {"started": now_s if now_s is not None else time.monotonic(),
+                     "countdown_s": countdown_s, "want": samples,
+                     "leans": [], "poses": [], "faces": [], "done_at": None}
+
+    def cancel_calibration(self) -> None:
+        self._cal = None
+
+    def update_calibration(self, raw_world_landmarks: list[Any],
+                           face_landmarks: list[Any] | None = None,
+                           image_size: tuple[int, int] | None = None,
+                           now_s: float | None = None) -> CalibrationState:
+        """Drive one frame of a running calibration. Safe to call every frame; a
+        no-op returning phase='idle' when none is running."""
+        cal = self._cal
+        if cal is None:
+            return CalibrationState("idle", 0.0, 0, 0, self.torso_lean_offset_deg)
+        now = now_s if now_s is not None else time.monotonic()
+
+        left = cal["countdown_s"] - (now - cal["started"])
+        if left > 0.0:
+            return CalibrationState("countdown", left, 0, cal["want"], self.torso_lean_offset_deg)
+
+        if cal["done_at"] is not None:
+            if now - cal["done_at"] > 2.0:  # leave the result on screen briefly
+                self._cal = None
+            return CalibrationState("done", 0.0, len(cal["leans"]), cal["want"], self.torso_lean_offset_deg)
+
+        if len(raw_world_landmarks) >= len(PoseLandmark):
+            cal["leans"].append(self.measure_torso_lean_deg(raw_world_landmarks))
+            cal["poses"].append(raw_world_landmarks)
+            face_rot = (self._face_mesh_rotation(face_landmarks, image_size)
+                        if face_landmarks and image_size else None)
+            cal["faces"].append(face_rot)
+
+        if len(cal["leans"]) < cal["want"]:
+            return CalibrationState("sampling", 0.0, len(cal["leans"]), cal["want"], self.torso_lean_offset_deg)
+
+        self.torso_lean_offset_deg = float(np.mean(cal["leans"]))
+        # Head neutral is averaged AFTER the lean offset lands, since the head pose is
+        # recorded relative to the (now corrected) torso frame.
+        rels = [body.inv() * face
+                for pose, face in zip(cal["poses"], cal["faces"]) if face is not None
+                and (body := self._body_rotation(pose)) is not None]
+        if rels:
+            self.head_neutral = R.concatenate(rels).mean()
+            self._head_rel = R.identity()
+        cal["done_at"] = now
+        return CalibrationState("done", 0.0, len(cal["leans"]), cal["want"], self.torso_lean_offset_deg)
 
     def calibrate_neutral(self, raw_world_landmarks: list[Any]) -> float:
         """Record the current lean as 'upright' and, if a face has been seen, the
@@ -505,6 +584,9 @@ class PoseSolver:
 
         hip_mid = (self.rest_pos[fi["thigh_l"]] + self.rest_pos[fi["thigh_r"]]) * 0.5
         up = normalize(shoulder_mid - hip_mid)
+        # Manny's own hip->shoulder line is 5.8 deg off vertical; torso lean is measured
+        # relative to this, not to vertical. See measure_torso_lean_deg().
+        self.rest_lean_deg = math.degrees(math.atan2(float(up[1]), float(up[2])))
         side = normalize(self.rest_pos[fi["thigh_l"]] - self.rest_pos[fi["thigh_r"]])
         fwd = normalize(np.cross(up, side))
         right = normalize(np.cross(up, fwd))

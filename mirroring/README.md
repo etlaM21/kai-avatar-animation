@@ -122,8 +122,13 @@ keep working unchanged from the command line exactly as before.
   `Conductor`, no restart): face smoothing alpha, pose smoothing alpha (this
   one also smooths both hands - `PoseSmoother` merges body + fingers into one
   call, there is no separate hand-alpha), torso lean offset, and a
-  "Calibrate upright" button (`pose_solver.calibrate_neutral()`, same as
-  pressing `c` in the plain debug window).
+  "Calibrate upright" button (`pose_solver.begin_calibration()`, same as
+  pressing `c` in the plain debug window): a 3 s countdown drawn big into
+  the video pane, then the lean and the neutral head pose are averaged
+  over 30 frames. Averaging matters - single frames of the same standing
+  clip vary by ~1°. The lean is measured relative to Manny's own rest
+  torso (which is 5.8° off vertical), so calibrating on a performer who
+  matches the rig is a no-op.
   Debug-overlay and FPS-display are GUI-only toggles.
 - **Restart-required controls**, grouped under a collapsible, scrollable
   **Advanced** section (collapsed by default): camera index/resolution,

@@ -311,6 +311,7 @@ class App:
         self._skeleton_enabled = tk.BooleanVar(value=True)
         self._fps_enabled = tk.BooleanVar(value=True)
         self._dirty_while_running = False
+        self._calibration_applied = False  # so one finished calibration writes the spinbox once
 
         self._build_layout()
         set_skeleton_overlay_enabled(self._skeleton_enabled.get())
@@ -649,8 +650,10 @@ class App:
         if not landmarks:
             messagebox.showinfo("Calibrate upright", "No pose detected yet - step into frame first.")
             return
-        offset = conductor.pose_solver.calibrate_neutral(landmarks)
-        self.torso_lean_var.set(round(offset, 1))
+        # Timed: a countdown to get back into position, then averaged over 30 frames.
+        # The countdown is drawn into the video pane by the conductor itself, so it is
+        # visible from across the room; _poll_calibration picks up the result.
+        conductor.start_calibration()
 
     # ---- start / stop / restart --------------------------------------------
 
@@ -762,7 +765,20 @@ class App:
             self.stop_btn.configure(state="disabled")
             self._clear_restart_dirty()
 
+        self._poll_calibration()
         self.root.after(33, self._poll_frame_queue)
+
+    def _poll_calibration(self) -> None:
+        """Mirror a running timed calibration into the lean spinbox once it lands.
+        The countdown itself is drawn into the video pane by the conductor - this only
+        picks up the averaged result, on the main thread like every other widget write."""
+        conductor = self.controller.conductor
+        state = getattr(conductor, "calibration_state", None) if conductor else None
+        if state is not None and state.phase == "done" and not self._calibration_applied:
+            self.torso_lean_var.set(round(state.lean_offset_deg, 1))
+            self._calibration_applied = True
+        elif state is None or state.phase != "done":
+            self._calibration_applied = False
 
     def _render_frame(self, frame) -> None:
         h, w = frame.shape[:2]

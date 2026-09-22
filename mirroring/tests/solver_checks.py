@@ -253,21 +253,6 @@ def synth_face(solver: PoseSolver, turn: R | None = None) -> list[Landmark]:
     return pts
 
 
-def synth_hand_solver_consistent(solver: PoseSolver, side: str) -> list[Landmark]:
-    """Landmarks walked out along the solver's OWN aim table (FINGER_AIM) and rest
-    directions. Every aim pair then matches its bone's rest direction exactly, so all
-    38 locals must come back as bind - a pure regression test of the solve math. It
-    says nothing about whether FINGER_AIM maps the right landmarks; see synth_hand()."""
-    at: dict[int, np.ndarray] = {int(H.WRIST): solver.finger_rest_pos[f"hand{side}"]}
-    for name, *_ in FINGER_CHAIN:
-        if not name.endswith(side):
-            continue
-        a, b = FINGER_AIM[name]
-        at[int(b)] = at[int(a)] + solver.finger_rest_dir[name] * 3.0
-    # Landmarks the aim table never reads (e.g. THUMB_TIP under the current mapping).
-    return [comp_to_landmark(at.get(i, at[int(H.WRIST)])) for i in range(21)]
-
-
 def synth_hand(solver: PoseSolver, side: str) -> list[Landmark]:
     """Landmarks at the rig's real joint positions (anatomical placement), NOT
     placed to satisfy the solver's own aim table."""
@@ -386,6 +371,31 @@ def check_bind_fk(solver: PoseSolver, rep: Report) -> None:
     rep.check(fsym < 0.05, f"fingers L/R mirror-symmetric (max {fsym:.3f} cm)")
     below = all(solver.finger_rest_pos[n][2] < z("upperarm_l") for n, *_ in FINGER_CHAIN)
     rep.check(below, "all finger joints below shoulder height (A-pose hands hang)")
+
+
+def check_calibration(rep: Report) -> None:
+    print("\n2b. Timed calibration (synthetic clock, no camera)")
+    solver = PoseSolver()
+    pose, face = synth_pose(solver), synth_face(solver)
+    solver.begin_calibration(countdown_s=3.0, samples=30, now_s=0.0)
+    phases: list[str] = []
+    for i in range(200):  # ~6.6 s at 30 fps
+        phases.append(solver.update_calibration(pose, face, SYNTH_FRAME, now_s=i / 30.0).phase)
+    counts = {p: phases.count(p) for p in dict.fromkeys(phases)}
+    rep.check(list(counts) == ["countdown", "sampling", "done", "idle"],
+              f"phases run countdown -> sampling -> done -> idle {counts}")
+    rep.check(counts["countdown"] >= 89, f"countdown lasts ~3 s ({counts['countdown']} frames at 30 fps)")
+    rep.check(counts["sampling"] + 1 == 30, f"averaged over 30 frames ({counts['sampling'] + 1})")
+    # The rig's own rest pose is upright and looking straight ahead, so a calibration
+    # taken on it must be a no-op - anything else means the calibration injects a bias.
+    rep.check(abs(solver.torso_lean_offset_deg) < 1e-6,
+              f"lean offset on the rig's own rest pose is 0 ({solver.torso_lean_offset_deg:+.4f} deg)")
+    rep.check(math.degrees(solver.head_neutral.magnitude()) < 1e-3,
+              f"head neutral on a straight-ahead face is identity "
+              f"({math.degrees(solver.head_neutral.magnitude()):.4f} deg)")
+    body = solver.solve(pose, face, SYNTH_FRAME)
+    bad = [BONE_NAMES[i] for i, b in enumerate(body) if quat_angle_deg(b.rotation, BIND_POSES[i]) > TOL_DEG]
+    rep.check(not bad, f"rest pose still solves to bind after calibrating ({22 - len(bad)}/22)")
 
 
 def _stats(errs: list[float]) -> str:
@@ -513,6 +523,7 @@ def main() -> int:
     rep = Report()
     check_rest_identity(solver, rep)
     check_bind_fk(solver, rep)
+    check_calibration(rep)
 
     recs = args.recordings or sorted((ROOT / "recordings").glob("*.npz"))
     if not recs:

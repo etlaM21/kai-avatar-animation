@@ -47,6 +47,7 @@ Requires:
 from __future__ import annotations
  
 import argparse
+import math
 import socket
 import time
 from pathlib import Path
@@ -66,7 +67,7 @@ from mediapipe_pose_osc_protocol import (
     PoseOSCEncoder,
     pose_landmark_channel_prefix,
 )
-from pose_solver import BoneTransform, PoseSolver
+from pose_solver import BoneTransform, CalibrationState, PoseSolver
 from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder
 from landmark_recorder import LandmarkRecorder
 
@@ -302,6 +303,9 @@ class Conductor:
         # Empty until the first valid detection, same as that list.
         self._last_valid_left_hand_bones: list[BoneTransform] = []
         self._last_valid_right_hand_bones: list[BoneTransform] = []
+        # Last CalibrationState while a timed calibration runs, else None. Read by the
+        # debug overlay and polled by the GUI.
+        self.calibration_state: CalibrationState | None = None
  
     # ---- timing ---------------------------------------------------------
  
@@ -511,9 +515,50 @@ class Conductor:
                     f"  [c] calibrate upright",
                     (int(20*s), int(100*s)), cv2.FONT_HERSHEY_SIMPLEX, 0.6*s, (255, 200, 0), t)
 
+        self._draw_calibration(frame, s)
         cv2.imshow(self.DEBUG_WINDOW, frame)
         return cv2.waitKey(1) & 0xFF
  
+    def _draw_calibration(self, frame, s: float) -> None:
+        """Countdown / progress for a running timed calibration, drawn big and
+        centred in the frame itself - during calibration the performer is looking at
+        themselves in the preview, not at a button or a terminal."""
+        state = self.calibration_state
+        if state is None or state.phase == "idle":
+            return
+        if state.phase == "countdown":
+            line1, line2 = f"{math.ceil(state.seconds_left)}", "STAND UPRIGHT, LOOK AT THE CAMERA"
+            colour = (0, 200, 255)
+        elif state.phase == "sampling":
+            line1, line2 = "HOLD STILL", f"{state.samples}/{state.samples_wanted}"
+            colour = (0, 200, 255)
+        else:
+            line1, line2 = "CALIBRATED", f"lean offset {state.lean_offset_deg:+.1f} deg"
+            colour = (0, 255, 0)
+
+        h, w = frame.shape[:2]
+        for text, scale, y in ((line1, 3.0 * s, 0.42), (line2, 0.9 * s, 0.52)):
+            thickness = max(2, int(round(3 * scale / 2)))
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+            cv2.putText(frame, text, ((w - tw) // 2, int(h * y) + th // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness)
+
+    # ---- calibration --------------------------------------------------------
+
+    def start_calibration(self, countdown_s: float = 3.0, samples: int = 30) -> None:
+        """Begin a timed calibration. Driven from the main loop by
+        _update_calibration(); the 'c' key and the GUI button both land here."""
+        self.pose_solver.begin_calibration(countdown_s=countdown_s, samples=samples)
+
+    def _update_calibration(self, pose_frame: PoseFrame, face_frame: FaceFrame) -> None:
+        face_lms = face_frame.landmarks if face_frame.valid else None
+        state = self.pose_solver.update_calibration(
+            pose_frame.world_landmarks if pose_frame.valid else [], face_lms, self.frame_size)
+        if state.phase == "done" and self.calibration_state is not None \
+                and self.calibration_state.phase != "done":
+            print(f"Calibrated over {state.samples} frames: lean offset {state.lean_offset_deg:+.1f} deg")
+        self.calibration_state = state if state.phase != "idle" else None
+
     # ---- main loop ---------------------------------------------------------
  
     def run(self) -> None:
@@ -550,14 +595,16 @@ class Conductor:
                     face_frame.head_roll_deg = head_pose_frame.roll_deg
                 if self.recorder is not None:
                     self.recorder.add(ts, pose_frame, face_frame, hands_frame, head_pose_frame)
+                self._update_calibration(pose_frame, face_frame)
                 self._handle_face(face_frame)
                 self._handle_pose(pose_frame, ts, hands_frame, face_frame)
 
                 if self.show_debug:
                     key = self._draw_debug(raw_frame, face_frame, pose_frame, hands_frame)
-                    if key == ord("c") and self._last_valid_world_landmarks:
-                        offset = self.pose_solver.calibrate_neutral(self._last_valid_world_landmarks)
-                        print(f"Torso lean calibrated: offset {offset:+.1f} deg")
+                    if key == ord("c"):
+                        # Timed now: countdown, then averaged over 30 frames. Step
+                        # back into position while it counts down.
+                        self.start_calibration()
                     elif key == 27:  # Esc
                         break
         except KeyboardInterrupt:
