@@ -398,6 +398,58 @@ def check_calibration(rep: Report) -> None:
     rep.check(not bad, f"rest pose still solves to bind after calibrating ({22 - len(bad)}/22)")
 
 
+def check_occlusion_gating(rep: Report) -> None:
+    print("\n2c. Occlusion gating (synthetic)")
+    from pose_solver import HOLD_BLEND_FRAMES
+
+    solver = PoseSolver()
+    rest = synth_pose(solver)
+
+    def bent(confidence: float) -> list[Landmark]:
+        """The rest pose with the left knee thrown 40 deg forward - what an invented
+        landmark looks like - at the given confidence."""
+        pts = [Landmark(lm.x, lm.y, lm.z, confidence, confidence) for lm in rest]
+        knee = landmarks_to_comp(rest)[int(P.LEFT_KNEE)]
+        hip = landmarks_to_comp(rest)[int(P.LEFT_HIP)]
+        moved = hip + R.from_euler("x", 40, degrees=True).apply(knee - hip)
+        lm = comp_to_landmark(moved)
+        pts[int(P.LEFT_KNEE)] = Landmark(lm.x, lm.y, lm.z, confidence, confidence)
+        return pts
+
+    def thigh_angle(landmarks: list[Landmark]) -> float:
+        _, g_pos = fk_body(solver, solver.solve(landmarks))
+        rest_dir = solver.rest_pos[solver.full_idx["calf_l"]] - solver.rest_pos[solver.full_idx["thigh_l"]]
+        return angle_deg(g_pos["calf_l"] - g_pos["thigh_l"], rest_dir)
+
+    for _ in range(5):
+        thigh_angle(rest)  # confident: establishes the pose to hold
+    moved_confident = thigh_angle(bent(1.0))
+    rep.check(moved_confident > 35.0, f"confident landmarks are followed ({moved_confident:.1f} deg of 40)")
+
+    solver = PoseSolver()
+    for _ in range(5):
+        thigh_angle(rest)
+    held = [thigh_angle(bent(0.2)) for _ in range(HOLD_BLEND_FRAMES * 2)]
+    rep.check(held[-1] < 1.0, f"low-confidence landmarks are held, not followed "
+              f"(settles at {held[-1]:.2f} deg)")
+    rep.check(max(held) < 1.0, f"the invented pose is never shown, not even for one frame "
+              f"(worst {max(held):.2f} deg)")
+
+    back = [thigh_angle(bent(1.0)) for _ in range(HOLD_BLEND_FRAMES + 2)]
+    rep.check(back[-1] > 35.0, f"following resumes when confidence returns ({back[-1]:.1f} deg)")
+    rep.check(all(b - a > -1e-9 for a, b in zip(back, back[1:])),
+              "and eases back monotonically rather than snapping")
+
+    # Hysteresis: between the two thresholds, a held bone stays held.
+    solver = PoseSolver()
+    for _ in range(5):
+        thigh_angle(rest)
+    for _ in range(HOLD_BLEND_FRAMES * 2):
+        thigh_angle(bent(0.2))
+    between = thigh_angle(bent(0.55))  # above HOLD_BELOW, below RESUME_ABOVE
+    rep.check(between < 1.0, f"a held bone stays held between the thresholds ({between:.2f} deg)")
+
+
 def _stats(errs: list[float]) -> str:
     a = np.array([e for e in errs if not math.isnan(e)])
     if not a.size:
@@ -420,6 +472,7 @@ def check_capture(path: Path) -> dict[str, list[float]]:
         rec = {k: (v[keep] if v.ndim and len(v) == len(keep) else v) for k, v in rec.items()}
         print(f"  trimmed to {trim['start_ms']}-{trim['end_ms']} ms (recordings/trims.json)")
     errs: dict[str, list[float]] = {}
+    held: dict[str, int] = {}
     add = lambda k, v: errs.setdefault(k, []).append(v)  # noqa: E731
     palm_local = {s: rest_palm_normal_local(solver, s) for s in ("_l", "_r")}
     fwd_local = solver.rest_global[solver.full_idx["head"]].inv().apply(np.array([0.0, 1.0, 0.0]))
@@ -436,7 +489,16 @@ def check_capture(path: Path) -> dict[str, list[float]]:
         g_rot, g_pos = fk_body(solver, body)
         m = landmarks_to_comp(pose)
 
+        # A gated bone is deliberately NOT following the landmarks (they are invented
+        # while it is occluded), so its error against them is meaningless. Count the
+        # frames instead, and measure direction error only over trusted ones.
+        for bone in list(BODY_CHILD) + ["hand_l", "hand_r", "clavicle_l", "clavicle_r"]:
+            held[bone] = held.get(bone, 0) + int(solver._hold_weight.get(bone, 0.0) > 0.0)
         for bone, a, b in BODY_TRUTH:
+            # Weight, not the gate flag: a bone easing back out of a hold is still
+            # partly held, and counting it as live would report the blend as error.
+            if solver._hold_weight.get(bone, 0.0) > 0.0:
+                continue
             add(bone, angle_deg(g_pos[BODY_CHILD[bone]] - g_pos[bone], m[b] - m[a]))
         for side, wrist, index in (("_l", P.LEFT_WRIST, P.LEFT_INDEX), ("_r", P.RIGHT_WRIST, P.RIGHT_INDEX)):
             add(f"hand{side}", angle_deg(g_rot[f"hand{side}"].apply(bone_axis(f"hand{side}")), m[index] - m[wrist]))
@@ -493,9 +555,11 @@ def check_capture(path: Path) -> dict[str, list[float]]:
     body_keys = [b for b, *_ in BODY_TRUTH] + ["hand_l", "hand_r", "clavicle_l", "clavicle_r", "torso"]
     print(f"  {sum(rec['pose_valid'])}/{n} frames with pose, "
           f"{sum(rec['lhand_valid'])} L-hand, {sum(rec['rhand_valid'])} R-hand")
-    print(f"  {'bone':<22}{'RMS':>6} {'max':>7} {'frames':>6}")
+    n_pose = int(sum(rec["pose_valid"]))
+    print(f"  {'bone':<22}{'RMS':>6} {'max':>7} {'frames':>6}  {'held':>5}")
     for k in body_keys:
-        print(f"  {k:<22}{_stats(errs.get(k, []))}")
+        pct = f"{held.get(k, 0) / n_pose * 100:4.0f}%" if n_pose else "    -"
+        print(f"  {k:<22}{_stats(errs.get(k, []))}  {pct}")
     body_all = [e for k in body_keys for e in errs.get(k, [])]
     print(f"  {'BODY overall':<22}{_stats(body_all)}")
     print(f"  {'(pose vs hand model)':<22}{_stats(errs.get('pose_vs_hand_model', []))}   "
@@ -524,6 +588,7 @@ def main() -> int:
     check_rest_identity(solver, rep)
     check_bind_fk(solver, rep)
     check_calibration(rep)
+    check_occlusion_gating(rep)
 
     recs = args.recordings or sorted((ROOT / "recordings").glob("*.npz"))
     if not recs:

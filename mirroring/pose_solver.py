@@ -202,6 +202,22 @@ def normalize(vec: np.ndarray) -> np.ndarray:
     return np.zeros_like(vec) if norm < 1e-6 else vec / norm
 
 
+def _landmark_confidence(landmarks: list[Any], indices) -> float:
+    """Lowest confidence among the landmarks a bone is aimed by. visibility ("is it
+    occluded") and presence ("is it in frame at all") both matter, and MediaPipe drops
+    them independently - the legs in the recordings fall to 0.63 visibility but 0.2
+    presence. Missing or None fields count as fully confident, so synthetic landmarks
+    (and any source that doesn't populate them) are never gated."""
+    worst = 1.0
+    for i in indices:
+        lm = landmarks[int(i)]
+        for value in (getattr(lm, "visibility", None), getattr(lm, "presence", None)):
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                continue
+            worst = min(worst, float(value))
+    return worst
+
+
 def swing_between(from_dir: np.ndarray, to_dir: np.ndarray) -> R:
     """Minimal rotation taking from_dir to to_dir. Twist about the bone is left free."""
     a, b = normalize(from_dir), normalize(to_dir)
@@ -260,6 +276,20 @@ NECK_SHARE = 0.4
 # roll lands on the wrist joint and the forearm stays unrotated. 0.5 is a visual
 # choice; 0.0 disables the redistribution entirely.
 FOREARM_TWIST_SHARE = 0.5
+
+# Occlusion gating. MediaPipe always returns all 33 landmarks: when a limb leaves
+# frame it INVENTS a plausible one rather than reporting nothing, and only
+# visibility/presence say so. Measured on the recordings: torso and arms sit at
+# ~1.0 throughout, while the legs fall to 0.42-0.63 visibility (presence ~0.2) for
+# 10-17% of frames - so these thresholds gate real dropouts, not normal tracking.
+# Hysteresis (hold below LOW, resume above HIGH) stops a limb flickering in and out
+# of hold while it hovers at the threshold.
+CONFIDENCE_HOLD_BELOW = 0.5
+CONFIDENCE_RESUME_ABOVE = 0.65
+# Frames to ease between following and holding, ~0.25 s at 30 fps. Entering the hold
+# is blended too: the held pose IS the live pose at that moment, so it costs nothing,
+# and it means a brief dip can't snap anything.
+HOLD_BLEND_FRAMES = 8
 
 FACE_LEFT, FACE_RIGHT = 454, 234
 FACE_EYE_LEFT, FACE_EYE_RIGHT = 263, 33
@@ -416,6 +446,12 @@ class PoseSolver:
         self._hand_delta: dict[str, R | None] = {"_l": None, "_r": None}
         # Running timed calibration, or None. See begin_calibration().
         self._cal: dict[str, Any] | None = None
+        # Occlusion gating state, per aimed bone: last trusted pose (relative to the
+        # torso, so a held limb still travels with the body), how far into the hold
+        # the blend is, and whether the bone is currently gated (for the hysteresis).
+        self._hold_pose: dict[str, R] = {}
+        self._hold_weight: dict[str, float] = {}
+        self._hold_gated: dict[str, bool] = {}
         self._build_rest_pose()
         self._build_finger_rest_pose()
         self._build_hand_frames()
@@ -724,6 +760,31 @@ class PoseSolver:
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
         return body_frame * self.rest_body_frame.inv()
 
+    def _apply_hold(self, name: str, live: R, body_rot: R, confidence: float) -> R:
+        """Follow the measurement while it can be trusted; hold the last trusted pose
+        while it can't. Held relative to the torso, so an occluded limb still turns
+        and travels with the body instead of freezing in world space."""
+        was_gated = self._hold_gated.get(name, False)
+        gated = confidence < (CONFIDENCE_RESUME_ABOVE if was_gated else CONFIDENCE_HOLD_BELOW)
+        self._hold_gated[name] = gated
+
+        # Into the hold immediately, out of it gradually. The held pose is the one the
+        # character is already in, so snapping to it can't pop - whereas blending IN
+        # means showing a frame or two of the invented pose first (measured: a 40 deg
+        # bogus knee bend still reached 35 deg before the hold caught it). Coming back
+        # does need the ramp: the live pose by then is somewhere else entirely.
+        weight = 1.0 if gated else max(0.0, self._hold_weight.get(name, 0.0) - 1.0 / HOLD_BLEND_FRAMES)
+        self._hold_weight[name] = weight
+
+        if weight <= 0.0:
+            self._hold_pose[name] = body_rot.inv() * live  # trusted: this is the pose to hold
+            return live
+        held = self._hold_pose.get(name)
+        if held is None:
+            return live
+        target = body_rot * held
+        return live * R.from_rotvec((live.inv() * target).as_rotvec() * weight)
+
     @staticmethod
     def _twist_about(rot: R, axis: np.ndarray) -> R:
         """The part of `rot` that spins about `axis` (swing-twist decomposition)."""
@@ -787,13 +848,17 @@ class PoseSolver:
             elif name in self.rest_dir:
                 if name == "clavicle_l":
                     aim = comp[int(_P.LEFT_SHOULDER)] - shoulder_mid
+                    conf = _landmark_confidence(raw_world_landmarks, (_P.LEFT_SHOULDER,))
                 elif name == "clavicle_r":
                     aim = comp[int(_P.RIGHT_SHOULDER)] - shoulder_mid
+                    conf = _landmark_confidence(raw_world_landmarks, (_P.RIGHT_SHOULDER,))
                 else:
                     a, b = BONE_AIM[name]
                     aim = comp[int(b)] - comp[int(a)]
+                    conf = _landmark_confidence(raw_world_landmarks, (a, b))
                 rest_world = body_rot.apply(self.rest_dir[name])
-                global_rot[i] = swing_between(rest_world, aim) * body_rot * self.rest_global[i]
+                live = swing_between(rest_world, aim) * body_rot * self.rest_global[i]
+                global_rot[i] = self._apply_hold(name, live, body_rot, conf)
             else:
                 global_rot[i] = global_rot[parent] * self.full_bind[i]
 

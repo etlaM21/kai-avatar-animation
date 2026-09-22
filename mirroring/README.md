@@ -283,6 +283,15 @@ retargeting). Taking it further to a MetaHuman is still just a plan:
   Half the wrist's twist is passed back to `lowerarm_*`, so pronation comes from
   the forearm instead of snapping at the wrist (`FOREARM_TWIST_SHARE`). Falls
   back to the old pose-INDEX aim per hand when that hand isn't tracked.
+- **Occlusion gating**: MediaPipe never reports "I can't see that limb" - it
+  invents a plausible landmark and lowers `visibility`/`presence`. Each aimed
+  bone is gated on the lowest of those across its own landmarks: below 0.5 it
+  holds its last trusted pose *relative to the torso* (so an occluded limb
+  still travels with the body), and resumes above 0.65, easing back over 8
+  frames. Entering the hold is instant - the held pose is where the character
+  already is, while blending in would show a frame of the invented one. On the
+  recordings this engages on feet/calves for 17-22% of frames and cuts their
+  frame-to-frame jitter ~25%; arms and torso never drop below threshold.
 - **Fingers**: `pose_solver.py`'s `solve_hands()` - the identical technique
   extended one layer past hand_l/hand_r, verified against a real
   `RefSkeleton` dump of Manny's finger rig (19 bones/hand: metacarpal + 3
