@@ -398,6 +398,45 @@ def check_calibration(rep: Report) -> None:
     rep.check(not bad, f"rest pose still solves to bind after calibrating ({22 - len(bad)}/22)")
 
 
+def check_ground_lock(rep: Report) -> None:
+    print("\n2d. Ground locking (synthetic)")
+    solver = PoseSolver()
+    rest = synth_pose(solver)
+    floor = solver._rest_ground_z
+
+    def lowest(landmarks: list[Landmark], lock: bool = True) -> tuple[float, float]:
+        s = PoseSolver(ground_lock=lock)
+        out = s.solve(landmarks)
+        _, pos = fk_body(s, out)
+        return min(pos[b][2] for b in PoseSolver.GROUND_CONTACT_BONES), out[0].position["z"]
+
+    foot_z, pelvis_z = lowest(rest)
+    rep.check(abs(pelvis_z - 95.8968) < 1e-3, f"rest pose keeps the bind pelvis height ({pelvis_z:.4f} cm)")
+    rep.check(abs(foot_z - floor) < 1e-6, f"rest pose stands on the rig's own floor ({foot_z:.3f} cm)")
+
+    # A crouch: knees and ankles pulled up towards the hips. Without the lock the
+    # character's feet leave the floor by exactly the amount it crouched.
+    pts = landmarks_to_comp(rest)
+    crouched = list(rest)
+    for lm, drop in ((P.LEFT_KNEE, 15.0), (P.RIGHT_KNEE, 15.0), (P.LEFT_ANKLE, 30.0),
+                     (P.RIGHT_ANKLE, 30.0), (P.LEFT_FOOT_INDEX, 30.0), (P.RIGHT_FOOT_INDEX, 30.0)):
+        p = pts[int(lm)].copy()
+        p[2] += drop
+        crouched[int(lm)] = comp_to_landmark(p)
+    locked_foot, locked_pelvis = lowest(crouched)
+    loose_foot, loose_pelvis = lowest(crouched, lock=False)
+    rep.check(abs(locked_foot - floor) < 1e-6,
+              f"crouching keeps the foot on the floor ({locked_foot:.3f} cm; unlocked it floats to {loose_foot:.1f})")
+    rep.check(locked_pelvis < loose_pelvis - 1.0,
+              f"and the pelvis drops to do it ({locked_pelvis:.1f} vs a pinned {loose_pelvis:.1f} cm)")
+    # Pinned means pinned: without the lock the pelvis is hip_mid + a constant, so a
+    # crouch that never moves the hips doesn't move it at all. (Not 95 cm here - these
+    # synthetic landmarks carry the rig's absolute positions, where real MediaPipe
+    # world landmarks are hip-centred.)
+    rep.check(abs(loose_pelvis - lowest(rest, lock=False)[1]) < 1e-6,
+              f"ground_lock=False ignores the crouch entirely ({loose_pelvis:.1f} cm either way)")
+
+
 def check_occlusion_gating(rep: Report) -> None:
     print("\n2c. Occlusion gating (synthetic)")
     from pose_solver import HOLD_BLEND_FRAMES
@@ -588,6 +627,7 @@ def main() -> int:
     check_rest_identity(solver, rep)
     check_bind_fk(solver, rep)
     check_calibration(rep)
+    check_ground_lock(rep)
     check_occlusion_gating(rep)
 
     recs = args.recordings or sorted((ROOT / "recordings").glob("*.npz"))

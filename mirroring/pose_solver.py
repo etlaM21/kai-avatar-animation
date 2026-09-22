@@ -423,8 +423,13 @@ FINGER_AIM: dict[str, tuple] = {**FINGER_AIM_L, **FINGER_AIM_R}
 
 class PoseSolver:
     def __init__(self, pelvis_default_height_cm: float = 95.0,
-                 torso_lean_offset_deg: float = 0.0) -> None:
+                 torso_lean_offset_deg: float = 0.0,
+                 ground_lock: bool = True) -> None:
         self.pelvis_default_height_cm = pelvis_default_height_cm
+        # Derive the pelvis height from where the feet actually end up, instead of
+        # pinning it. See _ground_locked_pelvis_z(). Set False to go back to the
+        # fixed height (the character then floats or sinks with every crouch).
+        self.ground_lock = ground_lock
         # MediaPipe's world landmarks place the shoulders in front of the hips, so a
         # performer standing vertically is reported as leaning ~18 deg forward. The bias
         # is near-constant (measured +17.8 deg on a vertical subject and +20.0 deg on a
@@ -623,6 +628,9 @@ class PoseSolver:
         # Manny's own hip->shoulder line is 5.8 deg off vertical; torso lean is measured
         # relative to this, not to vertical. See measure_torso_lean_deg().
         self.rest_lean_deg = math.degrees(math.atan2(float(up[1]), float(up[2])))
+        # Where the rig's own floor is: its lowest foot point in bind. Ground locking
+        # restores this height rather than pushing the foot down to z=0.
+        self._rest_ground_z = min(float(self.rest_pos[fi[b]][2]) for b in self.GROUND_CONTACT_BONES)
         side = normalize(self.rest_pos[fi["thigh_l"]] - self.rest_pos[fi["thigh_r"]])
         fwd = normalize(np.cross(up, side))
         right = normalize(np.cross(up, fwd))
@@ -725,6 +733,40 @@ class PoseSolver:
             points[i, 1] = -lm.x * 100.0   # Right (mirrored)
             points[i, 2] = -lm.y * 100.0   # Up
         return points
+
+    # -- ground locking ----------------------------------------------------------
+    GROUND_CONTACT_BONES = ("ball_l", "ball_r", "foot_l", "foot_r")
+
+    def _leg_positions(self, global_rot: list[R], pelvis_pos: np.ndarray) -> dict[str, np.ndarray]:
+        """Forward-kinematic positions of the leg chain, the same way Unreal will
+        compute them from the streamed rotations."""
+        pos = {"pelvis": pelvis_pos}
+        for i, (name, parent, _rot, off) in enumerate(FULL_CHAIN):
+            if parent == -1:
+                continue
+            parent_name = FULL_CHAIN[parent][0]
+            if parent_name not in pos or not any(
+                    name.startswith(p) for p in ("thigh", "calf", "foot", "ball")):
+                continue
+            pos[name] = pos[parent_name] + global_rot[parent].apply(np.asarray(off, dtype=float))
+        return pos
+
+    def _ground_locked_pelvis_z(self, global_rot: list[R], pelvis_pos: np.ndarray) -> float:
+        """Pelvis height that puts the lower foot back on the floor.
+
+        MediaPipe's world landmarks are hip-centred, so hip height carries no
+        information at all and the pelvis was simply pinned at a constant. Any crouch,
+        bend, or leg-length mismatch after retargeting then lifted or sank the feet -
+        measured on the recordings, the lower foot sat up to 2.7 cm below the rig's own
+        floor even while standing still.
+
+        The target is the rig's own lowest point in bind (the ball of the foot at
+        0.75 cm), not zero, so a standing performer reproduces the bind pose exactly
+        rather than being pushed down by the sole's thickness.
+        """
+        pos = self._leg_positions(global_rot, pelvis_pos)
+        lowest = min(pos[b][2] for b in self.GROUND_CONTACT_BONES if b in pos)
+        return float(pelvis_pos[2] + (self._rest_ground_z - lowest))
 
     def _rest_pose_output(self) -> list[BoneTransform]:
         return [BoneTransform(name=name, rotation=dict(BIND_POSES[i]), position=dict(BIND_POSITIONS[i]))
@@ -911,6 +953,9 @@ class PoseSolver:
 
         fi = self.full_idx
         pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
+        if self.ground_lock:
+            pelvis_pos = np.array([pelvis_pos[0], pelvis_pos[1],
+                                   self._ground_locked_pelvis_z(global_rot, pelvis_pos)])
 
         result: list[BoneTransform] = []
         for i, name in enumerate(BONE_NAMES):

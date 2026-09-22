@@ -283,6 +283,15 @@ retargeting). Taking it further to a MetaHuman is still just a plan:
   Half the wrist's twist is passed back to `lowerarm_*`, so pronation comes from
   the forearm instead of snapping at the wrist (`FOREARM_TWIST_SHARE`). Falls
   back to the old pose-INDEX aim per hand when that hand isn't tracked.
+- **Ground locking**: the pelvis height is derived each frame so the lower foot
+  sits on the rig's own floor (the ball of the foot at 0.75 cm in bind), instead
+  of being pinned at `pelvis_default_height_cm`. MediaPipe's world landmarks are
+  hip-centred, so hip height carries no information and the pinned version let
+  the feet sink up to 2.7 cm while merely standing, more with any crouch. The
+  rest pose still reproduces the bind pelvis height exactly.
+  `PoseSolver(ground_lock=False)` restores the old behaviour. Known limits: a
+  real jump reads as grounded, and while both feet are occluded the height comes
+  from their held pose.
 - **Occlusion gating**: MediaPipe never reports "I can't see that limb" - it
   invents a plausible landmark and lowers `visibility`/`presence`. Each aimed
   bone is gated on the lowest of those across its own landmarks: below 0.5 it
