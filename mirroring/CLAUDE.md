@@ -3,6 +3,9 @@
 Real-time markerless mocap: webcam → MediaPipe → OSC → a custom Live Link source
 driving the UE5 Mannequin (Manny).
 
+`README.md` describes the system as built. This file is the working guide: how to
+run things, what is load-bearing, what must not be re-broken, and what is still open.
+
 ## Environment
 
 Windows / PowerShell. There is a venv at `.\venv`.
@@ -14,220 +17,237 @@ scipy are only installed in the venv).
 
 ```powershell
 .\venv\Scripts\python.exe conductor.py --debug --camera 1
+.\venv\Scripts\python.exe gui.py
+.\venv\Scripts\python.exe tests\solver_checks.py
 .\venv\Scripts\python.exe -m pip install <pkg>
 ```
+
+In the debug window: `c` calibrates (see below), `Esc` quits.
 
 ## Architecture
 
 ```
 webcam (cv2, MJPG, up to 4K)
   └─ conductor.py            owns the single shared camera + both detectors,
-     │                       smoothing (EMA for face, NLERP for pose quats),
-     │                       debug overlay, and all sockets
-     ├─ mediapipe_face_capture.py  → FaceFrame  (blendshapes, head yaw/pitch/roll)
-     │    └─ live_link_face_protocol.py → UDP 11111 (Epic's stock Live Link Face)
-     └─ mediapipe_pose_capture.py  → PoseFrame  (33 world landmarks)
-          └─ pose_solver.py        → 22 BoneTransforms
-               └─ live_link_pose_osc_protocol.py → OSC 9001
-                    └─ MediaPipeLiveLink (UE5 C++ ILiveLinkSource, a dumb pipe)
+     │                       smoothing, debug overlay, recording, all sockets
+     ├─ mediapipe_holistic_capture.py   ONE inference pass → pose + face + hands
+     │    ├─ PoseFrame  (33 world landmarks, with visibility/presence)
+     │    ├─ FaceFrame  (52 ARKit blendshapes + 478 face mesh landmarks)
+     │    └─ HandsFrame (21 landmarks × 2 hands)
+     ├─ head_pose_capture.py            second FaceLandmarker, head yaw/pitch/roll
+     │                                  → Live Link Face. SEE WARNING BELOW.
+     ├─ pose_solver.py        pure math: landmarks in, 60 BoneTransforms out
+     │    └─ live_link_pose_osc_protocol.py → OSC 9001 → MediaPipeLiveLink (UE5)
+     ├─ live_link_face_protocol.py      → UDP 11111 (Epic's stock Live Link Face)
+     └─ landmark_recorder.py            optional --record dump for offline checks
+```
+
+Solver inputs, all optional except the first — each missing input degrades one
+part of the solve rather than failing:
+
+```python
+solve(pose_world_landmarks, face_landmarks, image_size, left_hand, right_hand)
+solve_hands(pose_world_landmarks, left_hand, right_hand)
 ```
 
 MediaPipe is used through the **Tasks API** (`mp.Image`, `.task` model bundles).
 The legacy `mp.solutions` namespace and `mediapipe.framework.formats.landmark_pb2`
 **do not exist** in the installed version. Drawing helpers come from
-`mediapipe.tasks.python.vision` (`drawing_utils`, `drawing_styles`,
-`PoseLandmarksConnections`, `FaceLandmarksConnections`) and take raw landmark lists
-natively — no protobuf conversion.
+`mediapipe.tasks.python.vision`.
 
 ## pose_solver.py — treat with care
 
 This file took a long, painful debugging pass to get right. Do not refactor it
-opportunistically, and do not "simplify" the parts described below.
+opportunistically.
 
-How it works: for each bone, compute the minimal **swing** rotation taking the bone's
-rest direction to the direction measured from the performer, then convert to
+**Core technique.** For each bone, compute the minimal **swing** rotation taking the
+bone's rest direction to the direction measured from the performer, then convert to
 parent-local with `local = parent_global⁻¹ * global`. Everything happens in Unreal's
-component space.
+component space (X = performer's left, Y = forward, Z = up).
 
-`PoseSolver` also solves Manny's 19-bone-per-hand finger rig (`solve_hands()`,
-`FINGER_CHAIN`), using the exact same technique one layer further down the same
-chain. It was originally a separate `hand_solver.py` reading `PoseSolver`'s public
-state from outside (to avoid duplicating the swing formula for hand_l/hand_r across
-files) — folded back in once that separation stopped paying for itself, since
-`solve_hands()` now reads hand_l/hand_r's live global rotation straight out of
-`_solve_body_globals()`, the same computation `solve()` itself uses, with no
-duplication at all. `FINGER_CHAIN` is VERIFIED against the same `RefSkeleton` dump
-of `SKM_Manny_Simple` as `BIND_POSES` — don't hand-edit it either. One accepted,
-disclosed approximation: each metacarpal's aim is measured `WRIST → MCP`, but MediaPipe
-has no landmark at the per-finger palm offset its REST direction actually starts from,
-costing a few degrees on metacarpals specifically. Every phalanx joint (the ones that
-actually drive curl/splay) solves to 0.000° in the bind-pose round-trip check.
+Where a full orientation is observable, a basis is used instead of a swing, because
+a swing leaves roll about the bone axis free:
 
-Things that were tried and are WRONG — do not reintroduce:
+| Part | How it is oriented |
+|---|---|
+| Torso, spine | Body frame from hips + shoulders |
+| Arms, legs | Swing from rest direction to measured direction |
+| `neck_01` / `head` | Full basis from the face mesh, split 40/60 (`NECK_SHARE`) |
+| `hand_l` / `hand_r` | Full basis from the palm plane |
+| Fingers | Swing, in the **hand's** frame (not the torso's) |
+| `lowerarm_*` | Swing + half the wrist's twist (`FOREARM_TWIST_SHARE`) |
+| Pelvis height | Derived so the lower foot sits on the floor (`ground_lock`) |
+
+**Things that were tried and are WRONG — do not reintroduce:**
 
 - Computing a delta against a hand-written T-pose reference table and composing it as
   `BIND_POSE * delta`. Not frame-correct: the delta lives in landmark space while
-  `BIND_POSE` is a parent-local rotation in component space. Produced a body tilt that
-  no sign flip could fix.
+  `BIND_POSE` is a parent-local rotation in component space.
 - Any "handedness conversion" such as `{-x,-y,-z,w}`. That is the quaternion conjugate,
   i.e. the inverse rotation. Landmark space is component space rotated 90° about Z —
   same handedness — so quaternions carry over directly.
-- Hand-deriving `BIND_POSES` / `BIND_POSITIONS`. They are verified against a
-  `RefSkeleton` dump of `SKM_Manny_Simple`. If the mesh changes, re-dump; don't guess.
+- Hand-deriving `BIND_POSES` / `BIND_POSITIONS` / `FINGER_CHAIN`. They are verified
+  against a `RefSkeleton` dump of `SKM_Manny_Simple`. If the mesh changes, re-dump.
+- Welding `neck_01`/`head` into `TORSO_BONES`. That is what killed head rotation.
+- Putting `neck_02` in `INTERNAL_BONES`. Unreal holds it at bind **relative to
+  `neck_01`**, so once `neck_01` moves independently, `neck_02` must follow it by FK.
+- Aiming the thumb `WRIST→CMC`. Manny's `thumb_01` **is** the thumb metacarpal, so it
+  runs `CMC→MCP`. The old mapping sheared the whole thumb by 18–32°.
+- Measuring the wrist's twist against the forearm directly. `hand_l`'s bind local
+  contains a −67.8° roll, which then counts as twist and tips the arm by 34°. Measure
+  against where the forearm *would* carry the hand at bind.
+- Measuring torso lean against **vertical**. Manny's own hip→shoulder line is 5.8° off
+  vertical, so calibrating an upright performer left the character 5.8° off its bind
+  pose. Lean is measured relative to the rig's rest torso.
 
-Non-obvious invariants:
+**Non-obvious invariants:**
 
 - `spine_03`, `spine_05` and `neck_02` exist in Manny but are NOT streamed. They are
   modelled internally anyway (`FULL_CHAIN`), because Unreal applies each streamed local
   transform relative to the bone's REAL parent. Omitting `spine_03` alone rotates the
   whole upper body by ~11°.
 - `_convert_landmarks_to_ue_space` mirrors X (`Right = -lm.x`). MediaPipe reports the
-  performer's LEFT side with positive `lm.x`.
-- Twist about each bone's axis is deliberately unconstrained. MediaPipe gives joint
-  positions, which cannot observe forearm pronation.
-- MediaPipe reports a vertically standing performer as leaning ~18° forward. This is a
-  known bias, corrected by `torso_lean_offset_deg` / `calibrate_neutral()`, not by
-  changing the solve.
+  performer's LEFT side with positive `lm.x`. Mirroring is verified in the data: a
+  raised `RIGHT_WRIST` drives `hand_r` on the character's right.
+- Twist about each **arm** bone's axis is unobservable from joint positions alone. The
+  wrist is the exception now that the palm plane is measured.
+- Metacarpals carry a few degrees of disclosed error: MediaPipe has no landmark at a
+  metacarpal's base, so they are aimed `WRIST→MCP`. Every phalanx solves exactly.
+- MediaPipe never reports "I can't see that limb" — it invents a landmark and lowers
+  `visibility`/`presence`. Hence the gating.
+- The face mesh is image-normalised only. Scaling x and z by width and y by height
+  makes it metrically consistent (verified: z×1.0 keeps the face most rigid).
 
-## Acceptance tests for any solver change
+## Acceptance tests
 
-Any change to `pose_solver.py` must keep all three passing. They need no camera —
-drive them from recorded landmark dumps.
+```powershell
+.\venv\Scripts\python.exe tests\solver_checks.py            # all recordings\*.npz
+.\venv\Scripts\python.exe tests\solver_checks.py some.npz   # one capture
+```
 
-1. **Rest-pose identity.** Feed the rig's own reference pose in; every one of the 22
-   output rotations must equal `BIND_POSES` (22/22).
-2. **Bind-pose FK is upright.** Forward-kinematic `BIND_POSES` + `BIND_POSITIONS` with
-   no mocap: head above feet, thigh > calf > foot descending, feet symmetric.
-   (`foot_l` must land at `(14.09, -0.99, 8.24)`, matching the rig's stored
-   `ik_foot_l`.)
-3. **Absolute direction error on a real capture.** Compare each bone's 3D direction
-   against the performer's, in absolute terms — NOT as an angle-from-spine, which is
-   invariant to body roll and will hide a tilt bug. Current baseline: RMS ≈ 0.6° on the
-   rest-pose capture, ≈ 2.0° on the kettlebell capture.
+No camera needed. Checks 1–2 are **asserted** (exit code 1 on failure); check 3 is a
+**report** on real captures. Any solver change must keep all of 1–2 passing.
 
-The same three, adapted, apply to `solve_hands()`: rest-pose identity (38 finger
-rotations must equal each bone's own bind rotation), bind-pose FK sane/symmetric
-L/R, and a synthetic bind-pose round-trip showing 0.000° error on every phalanx
-joint (metacarpals alone carry a few degrees — see above, not a regression).
+1. **Rest-pose identity** — the rig's own bind pose in, bind pose out: 22/22 body
+   bones, 30/30 phalanx and thumb bones, metacarpals within their disclosed 12.5°.
+   Plus: straight-ahead face mesh is a no-op; a turned head (yaw 30, pitch −15,
+   roll 10) round-trips at 0.0000° after Unreal-style FK; wrist roll of ±45/−60°
+   round-trips exactly.
+1b. **Anatomical report** — the same rest pose with landmarks at the rig's REAL joint
+   positions. Not asserted; this is what caught the thumb and hand mappings.
+2. **Bind-pose FK** — upright, symmetric, `foot_l` at `(14.09, -0.99, 8.24)`.
+2b. **Timed calibration** on a synthetic clock — phase sequence, countdown length,
+   sample count, and a no-op on the rig's own rest pose.
+2c. **Occlusion gating** — follows confident landmarks, holds low-confidence ones
+   without ever showing the invented pose, resumes monotonically, respects hysteresis.
+2d. **Ground locking** — bind pelvis height preserved, foot stays on the floor through
+   a crouch, `ground_lock=False` still ignores it.
+3. **Absolute direction error on real captures** — per-bone 3D direction vs the
+   performer, in absolute terms, NOT as an angle-from-spine (which is invariant to
+   body roll and hides tilt bugs).
+
+**Ground truth in the checks is deliberately independent of the solver's own aim
+tables.** Checking a bone against the same landmark pair the solver aims it by passes
+by construction and hides a mis-mapped bone — that is exactly how the thumb bug
+survived. Keep `BODY_TRUTH` / `FINGER_TRUTH` / `HAND_JOINT_AT` anatomical.
+
+### Current numbers (rest.npz / motion.npz)
+
+| Metric | Baseline | Now |
+|---|---|---|
+| Body bone directions | 0.07° / 0.18° | 0.00° / 0.00° (trusted frames) |
+| All finger bones | 11.2° / 10.9° | 0.00° / 0.00° |
+| Palm orientation | 19–26° / 25–47° | 3.0–3.8° / 3.1–4.1° |
+| Head turn | dead (welded to chest) | exact; −30…+35° yaw, −19…+43° pitch |
+| Lowest foot point | −2.0…+39.6 cm | 0.75 cm, every frame |
+| Legs held (occluded) | n/a | 17–22% of frames |
+
+The `hand_l`/`hand_r` rows read 10–25°, but they are measured against the *pose*
+model's INDEX point, which disagrees with the dedicated hand model by 15–23° RMS.
+The report prints that floor next to them. Not solver error.
+
+### Recording new captures
+
+```powershell
+.\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\name.npz
+```
+
+Raw landmarks (pre-solve, pre-smoothing), so recordings stay useful across solver
+rewrites. Add a trim window to `recordings\trims.json` — the performer walking to and
+from the laptop is in every clip and is not performance.
+
+## Calibration
+
+`c` in the debug window, or the GUI button: a 3 s countdown drawn large into the video
+pane, then the torso lean and the neutral head pose averaged over 30 frames.
+Single frames of the same standing clip spread 5.4–7.5°, so one snapshot is not
+enough. The state machine is in `PoseSolver.begin_calibration()` /
+`update_calibration()`; `conductor` drives it per frame, the GUI polls the result on
+the main thread. `calibrate_neutral()` still does a single-frame calibration.
+
+MediaPipe's forward-lean bias is **not constant across setups** — measured ~18° in
+earlier sessions and ~7° in the current recordings. Always calibrate; never hardcode.
+
+## gui.py — Tkinter control surface
+
+A wrapper that drives an unmodified `Conductor`; it reimplements no pipeline logic.
+`python conductor.py --debug --camera 1` must keep behaving identically. It
+monkeypatches `cv2.imshow`/`waitKey`/`namedWindow` before constructing `Conductor`,
+runs `run()` on a daemon thread, and updates widgets only on the main thread via
+`root.after`. Frame queue is `maxsize=1`, drop-when-full: **the GUI must never apply
+backpressure to the capture loop.**
+
+Live controls (no restart): smoothing alphas, torso lean, calibrate, overlay/FPS
+toggles. Restart-required (baked in at construction): camera index/resolution, model
+paths, ports/IPs, confidence thresholds — these mark the panel dirty and enable
+**Apply & Restart** rather than silently doing nothing.
+
+## Open items
+
+### For you (Malte)
+
+- **Test the new solver in UE.** Branch `feature/solver-fixes` is not merged.
+  Press "Calibrate upright" once, then: turn and nod your head, rotate your wrists
+  palm-up/palm-down, spread and curl your fingers, crouch, and lean out of frame.
+- **Decide who owns head rotation in UE.** The body stream now sends real head
+  rotation. If the MetaHuman Face AnimBP also drives the head from the ARKit solve,
+  they will fight — and since Live Link Face's head rotation is currently always zero
+  (see below), it may simply pin the head. Disable one of them.
+- **Decide about `head_pose_capture.py`.** Measured: that standalone FaceLandmarker
+  **never detects the face at performance distance** (it only fired while walking up
+  to the laptop, in both recordings), so Live Link Face's head yaw/pitch/roll has been
+  stuck at its initial zero the whole time. Options: (a) feed those three channels
+  from the same face-mesh basis the body solve uses, (b) delete the module and save an
+  inference pass per frame, or both.
+- **Record an occlusion clip** if you want the gating thresholds tuned harder: lean
+  over the desk until the legs leave frame, step half out of shot, put one arm behind
+  your back. Current thresholds come from the incidental leg dropouts in `motion.npz`.
+
+### Not started
+
+- **Step 4, GUI polish** (skipped on request): the video pane letterboxes heavily, the
+  camera Index field reads 0, and FPS is burned into the frame — a panel label with
+  min/avg would read better.
+- **Root translation.** MediaPipe world landmarks are hip-centred, so all global
+  movement is discarded *by construction*: the character can never step, shift or
+  jump, and ground locking reads a real jump as grounded. This needs image-space
+  landmarks or a separate position estimate — an architecture decision, not a tune.
+  Probably the biggest remaining gap for a live performance piece.
+- **Knees converge** — the character's stance is narrower than the performer's
+  (~0.65 knee/hip ratio measured earlier). Not investigated this session.
+- **Manny → MetaHuman retargeting** (README §6), and benchmarking Full Body IK vs
+  Body Mover + Limb IK.
+- **Kimodo/SOMA lane** — no code talks to it yet.
+- **Cleanup candidates**: `mediapipe_pose_osc_protocol.py` (reachable only through
+  dead code), `live_link_pose_json_protocol.py` (unused), `pose_landmarker_full.task`
+  (nothing loads it), this repo's stale `ue_plugin/` copy.
 
 ## Code standards
 
 - Python 3, type hints, dataclasses for frame/transform structs.
-- Comments explain *why*, especially where a non-obvious convention is load-bearing.
-- Prefer measuring over guessing: when a pose looks wrong, compute the error against
-  ground truth before changing any math.
-
-## gui.py — Tkinter control surface
-
-A single-window control surface for the mocap pipeline. It is a **wrapper**:
-`gui.py` is the only new file, and it drives the existing pipeline rather than
-reimplementing any of it.
-
-### Hard constraint: do not modify the existing scripts
-
-`conductor.py`, `pose_solver.py`, `mediapipe_*_capture.py` and the protocol modules
-must keep working unchanged when run from the command line exactly as they do today.
-`python conductor.py --debug --camera 1` must behave identically after this feature
-lands.
-
-The one permitted exception, if and only if the wrapper approach below proves
-unworkable: add an **optional** `frame_sink: Callable[[np.ndarray], None] | None = None`
-parameter to `Conductor.__init__`, called with the annotated frame in `_draw_debug`.
-It must default to `None` and preserve current behaviour exactly when unset. Propose
-this before doing it — do not change existing files silently.
-
-### Getting frames out of the conductor
-
-`Conductor` owns the camera and calls `cv2.imshow` itself, so the wrapper has to
-intercept. Preferred approach, which touches no project file:
-
-- Before constructing `Conductor`, monkeypatch in the `gui` module: `cv2.imshow` to
-  push the frame onto a `queue.Queue(maxsize=1)` instead of opening a window;
-  `cv2.waitKey` to return `-1`; `cv2.namedWindow` / `cv2.resizeWindow` to no-ops.
-- Construct `Conductor(show_debug=True, ...)` ALWAYS. If `show_debug` is `False` the
-  conductor never produces an annotated frame and the video pane goes black — the UI's
-  debug toggle must therefore be implemented some other way (see below), not by
-  flipping `show_debug`.
-
-Use a `maxsize=1` queue and drop frames when full. The GUI must never apply
-backpressure to the capture loop; a laggy UI must not become laggy tracking.
-
-### Threading
-
-`Conductor.run()` blocks. Run it on a `threading.Thread(daemon=True)`. Tkinter is not
-thread-safe: **all** widget updates happen on the main thread via `root.after(...)`
-polling the frame queue. Never touch a widget from the pipeline thread.
-
-Stopping: `Conductor.run()` loops until its own exit condition. Signal it with a
-`threading.Event` the wrapper checks, or set the flag the conductor already uses —
-whichever exists. Always `join()` with a timeout before restarting, or you leak camera
-handles and the next start fails with a device-busy error.
-
-### Live vs restart-required parameters
-
-This split is the core of the design. Get it right before building widgets.
-
-**Live** — adjustable while running, by assigning to the live object's attributes:
-- face / pose / hand smoothing factors (the `Smoother` alpha values)
-- torso lean offset (`pose_solver.torso_lean_offset_deg`), plus a "Calibrate upright"
-  button calling `pose_solver.calibrate_neutral(...)`
-- debug overlay toggle, FPS display toggle
-
-**Restart-required** — baked in when the MediaPipe task or camera is constructed:
-- camera index, capture width/height
-- every detection/tracking/presence confidence threshold
-- OSC and UDP ports, target IPs
-- model selection (lite/full/heavy)
-
-Restart-required controls must visibly indicate that they need a restart. Either
-disable them while running, or mark them dirty and enable an "Apply & Restart" button.
-Do not silently accept a change that has no effect — that is the single most confusing
-failure mode for this kind of panel.
-
-### Debug overlay toggle
-
-Since `show_debug` must stay `True`, implement the toggle by monkeypatching
-`mediapipe.tasks.python.vision.drawing_utils.draw_landmarks` to a no-op while the
-toggle is off. Leave the status text (`cv2.putText`) alone — it is cheap and useful.
-Note in a comment that skeleton drawing on a 4K frame is genuinely expensive, so this
-toggle is a real performance control, not just cosmetic.
-
-### FPS counter
-
-Measured in the wrapper from frames arriving on the queue, not from anything inside the
-conductor. Show a rolling average over ~30 frames, not the instantaneous value.
-Draw it into the video pane when the debug toggle is on.
-
-### Layout
-
-- Window height **max 720 px**. Resizable. Set a sensible `minsize`.
-- Roughly half the window is the webcam view. Preserve the capture aspect ratio when
-  scaling (letterbox rather than stretch); a distorted preview makes the tracking look
-  broken when it is not.
-- Controls in the other half, grouped: Camera · Smoothing · Calibration · Advanced.
-- **Advanced** is a collapsible section, collapsed by default, holding ports, IPs,
-  thresholds and model selection. A plain expand/collapse toggle is fine.
-
-### Styling
-
-Dark, technical, no icons or decoration. Flat colours, one accent for active state,
-monospace for numeric readouts. `ttk` does not honour background colours on all
-platforms with the default theme — use `ttk.Style().theme_use("clam")` as the base
-before restyling, or plain `tk` widgets where `ttk` fights you. Define the palette as
-module-level constants; do not scatter hex codes through the layout code.
-
-### Dependencies
-
-Displaying an OpenCV frame in Tkinter needs `Pillow` (`PIL.ImageTk`). Add it to the
-project's requirements. Convert BGR→RGB before handing the frame to PIL, or the preview
-comes out blue.
-
-### Acceptance checks
-
-1. `python conductor.py --debug --camera 1` still works, unchanged.
-2. Changing a smoothing slider visibly changes responsiveness without a restart.
-3. Changing the camera index and restarting picks up the new camera, with no
-   device-busy error on the old one.
-4. Toggling the debug overlay off measurably raises the FPS counter at 4K.
-5. Closing the window terminates the pipeline thread and releases the camera — no
-   orphaned `python.exe`.
+- Comments explain *why*, especially where a non-obvious convention is load-bearing,
+  and record what a number was measured from rather than asserting it.
+- **Prefer measuring over guessing**: when a pose looks wrong, compute the error
+  against ground truth before changing any math. Every fix in this session was found
+  that way, and two of them (the thumb, the lean reference) were invisible until the
+  ground truth was made independent of the solver.
