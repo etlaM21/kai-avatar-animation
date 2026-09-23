@@ -455,8 +455,11 @@ def check_occlusion_gating(rep: Report) -> None:
         pts[int(P.LEFT_KNEE)] = Landmark(lm.x, lm.y, lm.z, confidence, confidence)
         return pts
 
-    def thigh_angle(landmarks: list[Landmark]) -> float:
-        _, g_pos = fk_body(solver, solver.solve(landmarks))
+    def thigh_angle(landmarks: list[Landmark], with_hands: bool = False) -> float:
+        out = solver.solve(landmarks)
+        if with_hands:
+            solver.solve_hands(landmarks, [], [])  # conductor.py's per-frame call pattern
+        _, g_pos = fk_body(solver, out)
         rest_dir = solver.rest_pos[solver.full_idx["calf_l"]] - solver.rest_pos[solver.full_idx["thigh_l"]]
         return angle_deg(g_pos["calf_l"] - g_pos["thigh_l"], rest_dir)
 
@@ -487,6 +490,21 @@ def check_occlusion_gating(rep: Report) -> None:
         thigh_angle(bent(0.2))
     between = thigh_angle(bent(0.55))  # above HOLD_BELOW, below RESUME_ABOVE
     rep.check(between < 1.0, f"a held bone stays held between the thresholds ({between:.2f} deg)")
+
+    # conductor.py calls solve() and then solve_hands() on every frame, and both run
+    # the body solve. The hold has to advance once per FRAME, not once per call - the
+    # checks above only ever call solve(), so they can't see it stepping twice.
+    curves: list[list[float]] = []
+    for with_hands in (False, True):
+        solver = PoseSolver()
+        for _ in range(5):
+            thigh_angle(rest, with_hands)
+        for _ in range(HOLD_BLEND_FRAMES * 2):
+            thigh_angle(bent(0.2), with_hands)
+        curves.append([thigh_angle(bent(1.0), with_hands) for _ in range(HOLD_BLEND_FRAMES + 2)])
+    apart = max(abs(a - b) for a, b in zip(*curves))
+    rep.check(apart < TOL_DEG, f"solve_hands() after solve() doesn't step the hold a second time "
+              f"(ease-out {apart:.3f} deg apart from solve() alone)")
 
 
 def _stats(errs: list[float]) -> str:

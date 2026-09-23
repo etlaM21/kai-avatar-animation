@@ -802,24 +802,32 @@ class PoseSolver:
         body_frame = R.from_matrix(np.column_stack((fwd, right, up)))
         return body_frame * self.rest_body_frame.inv()
 
-    def _apply_hold(self, name: str, live: R, body_rot: R, confidence: float) -> R:
+    def _apply_hold(self, name: str, live: R, body_rot: R, confidence: float,
+                    advance: bool = True) -> R:
         """Follow the measurement while it can be trusted; hold the last trusted pose
         while it can't. Held relative to the torso, so an occluded limb still turns
-        and travels with the body instead of freezing in world space."""
-        was_gated = self._hold_gated.get(name, False)
-        gated = confidence < (CONFIDENCE_RESUME_ABOVE if was_gated else CONFIDENCE_HOLD_BELOW)
-        self._hold_gated[name] = gated
+        and travels with the body instead of freezing in world space.
 
-        # Into the hold immediately, out of it gradually. The held pose is the one the
-        # character is already in, so snapping to it can't pop - whereas blending IN
-        # means showing a frame or two of the invented pose first (measured: a 40 deg
-        # bogus knee bend still reached 35 deg before the hold caught it). Coming back
-        # does need the ramp: the live pose by then is somewhere else entirely.
-        weight = 1.0 if gated else max(0.0, self._hold_weight.get(name, 0.0) - 1.0 / HOLD_BLEND_FRAMES)
-        self._hold_weight[name] = weight
+        advance=False re-evaluates the frame solve() already stepped, without stepping
+        it again - see solve_hands()."""
+        if advance:
+            was_gated = self._hold_gated.get(name, False)
+            gated = confidence < (CONFIDENCE_RESUME_ABOVE if was_gated else CONFIDENCE_HOLD_BELOW)
+            self._hold_gated[name] = gated
+
+            # Into the hold immediately, out of it gradually. The held pose is the one the
+            # character is already in, so snapping to it can't pop - whereas blending IN
+            # means showing a frame or two of the invented pose first (measured: a 40 deg
+            # bogus knee bend still reached 35 deg before the hold caught it). Coming back
+            # does need the ramp: the live pose by then is somewhere else entirely.
+            weight = 1.0 if gated else max(0.0, self._hold_weight.get(name, 0.0) - 1.0 / HOLD_BLEND_FRAMES)
+            self._hold_weight[name] = weight
+        else:
+            weight = self._hold_weight.get(name, 0.0)
 
         if weight <= 0.0:
-            self._hold_pose[name] = body_rot.inv() * live  # trusted: this is the pose to hold
+            if advance:
+                self._hold_pose[name] = body_rot.inv() * live  # trusted: this is the pose to hold
             return live
         held = self._hold_pose.get(name)
         if held is None:
@@ -843,6 +851,7 @@ class PoseSolver:
         image_size: tuple[int, int] | None = None,
         left_hand_world_landmarks: list[Any] | None = None,
         right_hand_world_landmarks: list[Any] | None = None,
+        advance_hold: bool = True,
     ) -> tuple[list[R], R, np.ndarray] | None:
         """Shared by solve() and solve_hands(): computes every FULL_CHAIN
         bone's global rotation, plus the whole-body orientation (body_rot)
@@ -900,7 +909,7 @@ class PoseSolver:
                     conf = _landmark_confidence(raw_world_landmarks, (a, b))
                 rest_world = body_rot.apply(self.rest_dir[name])
                 live = swing_between(rest_world, aim) * body_rot * self.rest_global[i]
-                global_rot[i] = self._apply_hold(name, live, body_rot, conf)
+                global_rot[i] = self._apply_hold(name, live, body_rot, conf, advance_hold)
             else:
                 global_rot[i] = global_rot[parent] * self.full_bind[i]
 
@@ -1036,9 +1045,14 @@ class PoseSolver:
         solve() uses for the streamed body bones - so finger parent-local
         rotations always compose against the value actually being sent to
         Unreal for that bone this frame - including the palm-plane orientation,
-        since the same hand landmarks are passed through to it here."""
+        since the same hand landmarks are passed through to it here.
+
+        Assumes solve() has already run on this frame, as conductor.py does: it
+        reuses the occlusion-hold state solve() stepped rather than stepping it
+        again. Stepping it twice per frame halved HOLD_BLEND_FRAMES live."""
         solved = self._solve_body_globals(pose_world_landmarks, None, None,
-                                          left_hand_world_landmarks, right_hand_world_landmarks)
+                                          left_hand_world_landmarks, right_hand_world_landmarks,
+                                          advance_hold=False)
         if solved is None:
             hand_delta = {"_l": None, "_r": None}
             hand_l_global = hand_r_global = None
