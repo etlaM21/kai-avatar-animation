@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import struct
 import sys
 from pathlib import Path
 
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from landmark_recorder import Landmark, load_recording, to_landmarks  # noqa: E402
+from live_link_face_protocol import LiveLinkFaceEncoder, head_rotation_to_curves  # noqa: E402
 from mediapipe_pose_capture import PoseLandmark as P  # noqa: E402
 from pose_solver import (  # noqa: E402
     BIND_POSES, BONE_NAMES, FINGER_AIM, FINGER_CHAIN, FULL_CHAIN, PTS_TO_COMPONENT, PoseSolver,
@@ -507,6 +509,113 @@ def check_occlusion_gating(rep: Report) -> None:
               f"(ease-out {apart:.3f} deg apart from solve() alone)")
 
 
+# What a MetaHuman does with the Live Link Face head curves, as MEASURED on UE 5.8 by
+# tests/ue_head_probe.py --measure. Written out here, not imported from
+# live_link_face_protocol: checking the conversion against its own constants would
+# pass by construction, the same way the thumb bug survived its own aim table.
+# Rotation in component space (X = character's left, Y = forward, Z = up), absolute:
+#   headYaw +1 -> -50 deg about Z, headPitch +1 -> +50 deg about X,
+#   headRoll +1 -> -50 deg about Y, composed pitch * roll * yaw.
+def wire_head_curves(packet: bytes) -> tuple[float, float, float]:
+    """headYaw, headPitch, headRoll as they sit on the wire (slots 52-54)."""
+    name_len = struct.unpack("!i", packet[41:45])[0]
+    return struct.unpack("!61f", packet[45 + name_len + 17:])[52:55]
+
+
+def metahuman_head_from_packet(packet: bytes) -> R:
+    yaw, pitch, roll = wire_head_curves(packet)
+    return (R.from_rotvec([50.0 * pitch, 0.0, 0.0], degrees=True)
+            * R.from_rotvec([0.0, -50.0 * roll, 0.0], degrees=True)
+            * R.from_rotvec([0.0, 0.0, -50.0 * yaw], degrees=True))
+
+
+def _face_packet(solver: PoseSolver) -> bytes:
+    """The face channel exactly as conductor sends it: solver -> curves -> wire."""
+    return LiveLinkFaceEncoder().encode(head_rotation_to_curves(solver.head_rotation))
+
+
+def _turn_whole_body(landmarks: list[Landmark], turn: R) -> list[Landmark]:
+    pts = landmarks_to_comp(landmarks)
+    hip_mid = (pts[int(P.LEFT_HIP)] + pts[int(P.RIGHT_HIP)]) * 0.5
+    return [comp_to_landmark(hip_mid + turn.apply(p - hip_mid)) for p in pts]
+
+
+def check_face_channel_head(rep: Report) -> None:
+    print("\n2e. Face-channel head round-trip (synthetic, through the wire)")
+    # Turned torsos matter most: the curve path is absolute, so a torso-relative
+    # passthrough bug is invisible square-on and only shows once the body turns.
+    torsos = {"square": R.identity(),
+              "yaw +45": R.from_euler("z", 45, degrees=True),
+              "yaw -60": R.from_euler("z", -60, degrees=True),
+              "yaw 30 + lean 10": R.from_euler("zx", [30, -10], degrees=True),
+              "yaw -20 + roll 8": R.from_euler("zy", [-20, 8], degrees=True)}
+    heads = {"straight": R.identity(),
+             "yaw 30": R.from_euler("z", 30, degrees=True),
+             "pitch -15": R.from_euler("x", -15, degrees=True),
+             "roll 10": R.from_euler("y", 10, degrees=True),
+             "yaw 35 pitch 20 roll -12": R.from_euler("zxy", [35, 20, -12], degrees=True)}
+    worst, worst_case, passthrough = 0.0, "", 0.0
+    for tname, torso in torsos.items():
+        for hname, head in heads.items():
+            solver = PoseSolver()
+            pose = _turn_whole_body(synth_pose(solver), torso)
+            solver.solve(pose, synth_face(solver, torso * head), SYNTH_FRAME)
+            got = metahuman_head_from_packet(_face_packet(solver))
+            err = math.degrees((got.inv() * (torso * head)).magnitude())
+            if err > worst:
+                worst, worst_case = err, f"{tname} / {hname}"
+            # What sending the torso-relative head alone would have shown instead.
+            passthrough = max(passthrough, math.degrees((head.inv() * (torso * head)).magnitude()))
+    rep.check(worst < 0.01, f"MetaHuman head lands on the performer's head, {len(torsos) * len(heads)} "
+              f"torso/head combinations (worst {worst:.4f} deg{', ' + worst_case if worst_case else ''}; "
+              f"a torso-relative passthrough would be off by up to {passthrough:.1f})")
+
+    # Calibrated neutral means the same in both paths: the head in line with the
+    # torso. Calibrate on a torso turned 20 deg with the face mesh pitched 8 deg off
+    # it (the mesh's own forehead->chin offset) - afterwards that pose must put the
+    # MetaHuman head in line with the torso the body stream RENDERS, not at identity.
+    # Compared against the rendered torso rather than the synthetic one on purpose:
+    # measure_torso_lean_deg() reads lean along the camera's forward axis, so a torso
+    # turned at calibration under-counts the rig's 5.8 deg rest lean (0.35 deg at 20,
+    # 1.7 at 45). That is a lean-calibration issue the head correctly follows.
+    solver = PoseSolver()
+    torso = R.from_euler("z", 20, degrees=True)
+    pose = _turn_whole_body(synth_pose(solver), torso)
+    face = synth_face(solver, torso * R.from_euler("x", 8, degrees=True))
+    solver.begin_calibration(countdown_s=0.0, samples=30, now_s=0.0)
+    for i in range(31):
+        solver.update_calibration(pose, face, SYNTH_FRAME, now_s=i / 30.0)
+    g_rot, _ = fk_body(solver, solver.solve(pose, face, SYNTH_FRAME))
+    rendered = g_rot["spine_04"] * solver.rest_global[solver.full_idx["spine_04"]].inv()
+    err = math.degrees((metahuman_head_from_packet(_face_packet(solver)).inv() * rendered).magnitude())
+    rep.check(err < 0.01, f"after calibration the neutral head sits in line with the rendered torso ({err:.4f} deg)")
+
+
+def check_face_channel_moves(recs: list[Path], rep: Report) -> None:
+    """The old failure was silent: the three head channels read zero for the whole
+    project while everything else worked. So: on real captures, through the wire,
+    the head channels must actually move."""
+    print("\n2f. Face-channel head moves on real captures (not-zero regression)")
+    if not recs:
+        print("  SKIPPED (no recordings)")
+        return
+    for path in recs:
+        rec, _ = load_trimmed(path)
+        frame_size = tuple(int(v) for v in rec["frame_size"])
+        solver = PoseSolver()
+        curves = []
+        for f in range(len(rec["t_ms"])):
+            if not rec["pose_valid"][f]:
+                continue
+            face = to_landmarks(rec["face_image"][f]) if rec["face_valid"][f] else None
+            solver.solve(to_landmarks(rec["pose_world"][f]), face, frame_size)
+            curves.append(wire_head_curves(_face_packet(solver)))
+        spread = np.ptp(np.array(curves), axis=0) * 50.0  # degrees, at the measured 50/unit
+        rep.check(bool(np.all(spread > 1.0)),
+                  f"{path.name}: head curves span yaw {spread[0]:.1f}, pitch {spread[1]:.1f}, "
+                  f"roll {spread[2]:.1f} deg over {len(curves)} frames (each must exceed 1 deg)")
+
+
 def _stats(errs: list[float]) -> str:
     a = np.array([e for e in errs if not math.isnan(e)])
     if not a.size:
@@ -514,19 +623,26 @@ def _stats(errs: list[float]) -> str:
     return f"{math.sqrt(float(np.mean(a ** 2))):6.2f} {float(np.max(a)):7.2f} {a.size:6d}"
 
 
-def check_capture(path: Path) -> dict[str, list[float]]:
-    print(f"\n3. Absolute direction error - {path.name}")
-    # Fresh solver per recording: the head pose is held across face dropouts, and
-    # must not leak from one recording into the next.
-    solver = PoseSolver()  # torso_lean_offset 0: the torso row then measures the raw solve
+def load_trimmed(path: Path) -> tuple[dict, dict | None]:
+    """A recording, cut to its recordings/trims.json window: the walk to and from
+    the laptop at either end is in every clip and is not performance."""
     rec = load_recording(path)
-    frame_size = tuple(int(v) for v in rec["frame_size"])
-    # recordings/trims.json cuts the walk to/from the laptop at either end.
     trims_file = path.parent / "trims.json"
     trim = json.loads(trims_file.read_text()).get(path.name) if trims_file.exists() else None
     if trim:
         keep = (rec["t_ms"] >= trim["start_ms"]) & (rec["t_ms"] <= trim["end_ms"])
         rec = {k: (v[keep] if v.ndim and len(v) == len(keep) else v) for k, v in rec.items()}
+    return rec, trim
+
+
+def check_capture(path: Path) -> dict[str, list[float]]:
+    print(f"\n3. Absolute direction error - {path.name}")
+    # Fresh solver per recording: the head pose is held across face dropouts, and
+    # must not leak from one recording into the next.
+    solver = PoseSolver()  # torso_lean_offset 0: the torso row then measures the raw solve
+    rec, trim = load_trimmed(path)
+    frame_size = tuple(int(v) for v in rec["frame_size"])
+    if trim:
         print(f"  trimmed to {trim['start_ms']}-{trim['end_ms']} ms (recordings/trims.json)")
     errs: dict[str, list[float]] = {}
     held: dict[str, int] = {}
@@ -647,8 +763,10 @@ def main() -> int:
     check_calibration(rep)
     check_ground_lock(rep)
     check_occlusion_gating(rep)
+    check_face_channel_head(rep)
 
     recs = args.recordings or sorted((ROOT / "recordings").glob("*.npz"))
+    check_face_channel_moves(recs, rep)
     if not recs:
         print("\n3. Absolute direction error - SKIPPED (no recordings; pass a .npz or add recordings/*.npz)")
     for path in recs:

@@ -37,10 +37,10 @@ webcam (cv2, MJPG, up to 4K)
      │     ├─ FaceFrame   (52 ARKit blendshapes + face mesh landmarks)
      │     └─ HandsFrame  (21 landmarks x 2 hands, world + image space)
      │
-     ├─ head_pose_capture.py           a second, much cheaper FaceLandmarker
-     │     └─ HeadPoseFrame (yaw/pitch/roll only)  — HolisticLandmarkerResult
-     │        has no transformation-matrix output, so this is the only source
-     │        for head rotation; conductor.py stitches it into FaceFrame.
+     ├─ head_pose_capture.py           DISABLED (commented out, kept on purpose -
+     │                                 see CLAUDE.md). It never detected the face
+     │                                 at performance distance; head rotation now
+     │                                 comes from pose_solver's face-mesh basis.
      │
      ├─ pose_solver.py                 pure math - no MediaPipe/camera code,
      │     │                           just landmarks in, BoneTransforms out
@@ -67,7 +67,11 @@ order or field names.
   `live_link_face_protocol.py`. 52 ARKit blendshapes + headYaw/Pitch/Roll + 6
   always-zero eye-rotation channels (MediaPipe gives eye-look blendshapes, not
   a separate eye bone rotation). Consumed by the stock Live Link Face plugin -
-  zero custom UE code on this side.
+  zero custom UE code on this side. On a MetaHuman these head curves are the
+  ONLY route to the visible head (the body stream's head is discarded there):
+  they set an absolute component-space rotation at 50 deg per unit, which
+  `head_rotation_to_curves()` produces from `PoseSolver.head_rotation`.
+  Measured with `tests/ue_head_probe.py --measure`.
 - **Pose + hands → OSC `/mediapipe/pose`, UDP 9001.** One message per frame:
   `[present (1.0/0.0), then 7 floats per bone (position x/y/z, rotation
   x/y/z/w)]` for all 60 bones (22 body + 19 left-hand + 19 right-hand,

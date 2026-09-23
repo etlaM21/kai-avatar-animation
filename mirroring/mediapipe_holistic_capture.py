@@ -16,13 +16,13 @@ Why one detector instead of two:
       support.
 
 What Holistic does NOT give you: HolisticLandmarkerResult has no
-facial_transformation_matrixes field, so head yaw/pitch/roll has no source
-here. See head_pose_capture.py for why that's a separate, much cheaper
-FaceLandmarker pass rather than something reimplemented on top of
-face_landmarks.
+facial_transformation_matrixes field, so head yaw/pitch/roll has no direct
+source here. The pose solver derives the head orientation from
+face_landmarks instead; head_pose_capture.py, the separate FaceLandmarker
+pass that used to supply it, is disabled - see CLAUDE.md.
 
 Does NOT own a camera - Conductor owns the single shared camera and hands
-the same frame here and to HeadPoseCapture.
+the frame here.
 
 Requires:
     pip install mediapipe opencv-python numpy
@@ -57,8 +57,9 @@ class FaceFrame:
 
     Same shape as the old mediapipe_face_capture.FaceFrame. head_yaw/pitch/
     roll_deg are NOT populated here (Holistic has no transformation-matrix
-    output) - they default to 0.0 and Conductor overwrites them from a
-    HeadPoseFrame (head_pose_capture.py) before this frame is used.
+    output) and stay 0.0: they were filled from head_pose_capture.py, which
+    is disabled. The face channel's head rotation now comes from
+    PoseSolver.head_rotation - see conductor.py.
     """
 
     valid: bool  # True only if a face was actually found this frame

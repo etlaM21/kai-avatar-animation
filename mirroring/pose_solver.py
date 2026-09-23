@@ -446,6 +446,12 @@ class PoseSolver:
         # a few degrees, people carry their heads differently). Identity = mesh as-is.
         self.head_neutral = R.identity()
         self._last_face_rot: R | None = None
+        # The head's rotation off the rig's rest head in component space, TORSO
+        # INCLUDED, as of the last solve() with a body - the Live Link Face channel's
+        # source (live_link_face_protocol.head_rotation_to_curves). None until then.
+        # Neutral is the same as the body stream's: after calibration the head sits in
+        # line with the torso, so this equals the torso's own rotation, not identity.
+        self.head_rotation: R | None = None
         # Per-hand rotation from the rig's rest hand to the measured one, set by
         # _solve_body_globals() and read by solve_hands() so both agree on the wrist.
         self._hand_delta: dict[str, R | None] = {"_l": None, "_r": None}
@@ -961,6 +967,9 @@ class PoseSolver:
         global_rot, _body_rot, hip_mid = solved
 
         fi = self.full_idx
+        # Read off the head's global rather than recomposed from body_rot/_head_rel,
+        # so the face channel is by construction the same head the body stream sends.
+        self.head_rotation = global_rot[fi["head"]] * self.rest_global[fi["head"]].inv()
         pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
         if self.ground_lock:
             pelvis_pos = np.array([pelvis_pos[0], pelvis_pos[1],

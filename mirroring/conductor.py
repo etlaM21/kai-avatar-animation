@@ -16,12 +16,13 @@ Why one shared camera feeding both detectors, instead of two separate
 scripts each with their own: most webcams only allow one reader at a
 time. Two processes each independently calling cv2.VideoCapture(0)
 tend to fight over the device (one fails to open, or gets a frozen
-feed). Conductor captures exactly once per loop and hands the same
-frame to both MediaPipeHolisticCapture.process() (pose, face, hands
-in one pass) and HeadPoseCapture.process() (head yaw/pitch/roll only,
-via a second, much cheaper FaceLandmarker - HolisticLandmarkerResult
-has no transformation-matrix output), which removes that conflict at
-its root instead of routing around it (e.g. with a virtual camera app).
+feed). Conductor captures exactly once per loop and hands the frame to
+MediaPipeHolisticCapture.process() (pose, face, hands in one pass),
+which removes that conflict at its root instead of routing around it
+(e.g. with a virtual camera app). Head yaw/pitch/roll for the face
+channel come from the pose solver's face-mesh head basis; the second
+FaceLandmarker pass that used to supply them (head_pose_capture.py) is
+disabled - see CLAUDE.md.
  
 Responsibilities, per loop iteration:
     1. Capture ONE frame from the one shared camera.
@@ -58,8 +59,9 @@ from pythonosc.udp_client import SimpleUDPClient
 import numpy as np
  
 from live_link_face_protocol import CHANNEL_ORDER as FACE_CHANNEL_ORDER
-from live_link_face_protocol import LiveLinkFaceEncoder
-from head_pose_capture import HeadPoseCapture
+from live_link_face_protocol import LiveLinkFaceEncoder, head_rotation_to_curves
+# Disabled, kept on purpose: see CLAUDE.md, "head_pose_capture.py - disabled".
+# from head_pose_capture import HeadPoseCapture
 from mediapipe_holistic_capture import FaceFrame, HandsFrame, MediaPipeHolisticCapture
 from mediapipe_pose_capture import PoseFrame, PoseLandmark
 from mediapipe_pose_osc_protocol import (
@@ -227,7 +229,7 @@ class Conductor:
     def __init__(
         self,
         holistic_capture: MediaPipeHolisticCapture,
-        head_pose_capture: HeadPoseCapture,
+        # head_pose_capture: HeadPoseCapture,  # disabled - see CLAUDE.md
         camera_index: int = 0,
         camera_width: int | None = None,
         camera_height: int | None = None,
@@ -243,7 +245,7 @@ class Conductor:
         record_path: str | None = None,
     ) -> None:
         self.holistic_capture = holistic_capture
-        self.head_pose_capture = head_pose_capture
+        # self.head_pose_capture = head_pose_capture  # disabled - see CLAUDE.md
         self.show_debug = show_debug
         self._warned_no_pose_lms = False
         self._warned_no_face_lms = False
@@ -324,20 +326,12 @@ class Conductor:
  
     def _face_frame_to_channel_values(self, frame: FaceFrame) -> dict[str, float]:
         """Turns a FaceFrame's blendshapes into the flat channel dict both the
-        smoother and the encoder work with. Head channels: _head_channel_values()."""
+        smoother and the encoder work with. Head channels come from the pose
+        solve instead - see run()."""
         values = dict(frame.blendshapes)
         for name in _UNRESOLVED_EYE_CHANNELS:
             values[name] = 0.0
         return values
-
-    @staticmethod
-    def _head_channel_values(frame: FaceFrame) -> dict[str, float]:
-        # deg/90 is UNVERIFIED: the source feeding it (head_pose_capture) almost never
-        # detected a face at performance distance, so this scale was never seen working.
-        # Units and signs are what tests/ue_head_probe.py measures.
-        return {"headYaw": frame.head_yaw_deg / 90.0,
-                "headPitch": frame.head_pitch_deg / 90.0,
-                "headRoll": frame.head_roll_deg / 90.0}
  
     def _pose_frame_to_channel_values(self, frame: PoseFrame) -> dict[str, float]:
         """Turns a PoseFrame's world landmarks into the same kind of flat
@@ -356,10 +350,11 @@ class Conductor:
  
     # ---- per-channel send ------------------------------------------------
  
-    def _handle_face(self, frame: FaceFrame, head_valid: bool) -> None:
-        """head_valid is separate from frame.valid on purpose: the head rotation's
-        source is not the blendshapes' source, and a face-mesh dropout must not
-        freeze the head along with the expression."""
+    def _handle_face(self, frame: FaceFrame, head_curves: dict[str, float] | None) -> None:
+        """head_curves (None = hold the last ones) is separate from frame.valid on
+        purpose: the head rotation's source is the pose solve, not the blendshapes',
+        and a face-mesh dropout must not freeze the head along with the expression -
+        the solver keeps carrying the head with the torso through it."""
         if frame.valid:
             raw_values = self._face_frame_to_channel_values(frame)
             self._last_valid_face_values.update(raw_values)
@@ -368,8 +363,8 @@ class Conductor:
             # a dropped detection for a frame or two shouldn't make the
             # face visibly snap to a blank expression.
             raw_values = self._last_valid_face_values
-        if head_valid:
-            self._last_valid_head_values = self._head_channel_values(frame)
+        if head_curves is not None:
+            self._last_valid_head_values = dict(head_curves)
 
         smoothed = self.face_smoother.apply(raw_values)
         # The body stream's head is smoothed with the pose alpha; with its own alpha
@@ -382,7 +377,9 @@ class Conductor:
         self.face_socket.sendto(packet, self.face_target)
  
     def _handle_pose(self, frame: PoseFrame, timestamp_ms: int, hands_frame: HandsFrame,
-                     face_frame: FaceFrame | None = None) -> None:
+                     face_frame: FaceFrame | None = None) -> bool:
+        """Solves and sends the body. Returns whether this frame was solved live -
+        i.e. whether pose_solver.head_rotation is this frame's."""
         if frame.valid and len(frame.world_landmarks) > 0:
             # Get raw solved bones from MediaPipe
             # The face mesh drives neck/head; without a face this frame the solver
@@ -430,6 +427,7 @@ class Conductor:
         # changes to support more bones.
         smoothed_bones = self.pose_smoother.apply(raw_bones + left_bones + right_bones)
         self.pose_encoder.send(smoothed_bones, present=present)
+        return present
         '''
         present = frame.valid  # the flag Live Link Face's protocol has no room for -> validates that a pose is currently present
         if frame.valid:
@@ -600,29 +598,28 @@ class Conductor:
                 # is safe - this costs one extra cheap wrap, not a real
                 # performance concern next to the model inference itself.
                 holistic_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                head_pose_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                # head_pose_capture is DISABLED, not deleted - see CLAUDE.md,
+                # "head_pose_capture.py - disabled, kept on purpose".
+                # head_pose_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
                 pose_frame, face_frame, hands_frame = self.holistic_capture.process(holistic_mp_image, ts)
-                head_pose_frame = self.head_pose_capture.process(head_pose_mp_image, ts)
-                # HolisticLandmarkerResult has no transformation-matrix
-                # equivalent, so head rotation is stitched in from the
-                # separate slim FaceLandmarker pass. Leave face_frame's
-                # 0.0 defaults in place if that pass missed this frame -
-                # _handle_face's hold-last-valid logic then carries the
-                # last known head pose forward, same as it already does
-                # for every other face channel.
-                if head_pose_frame.valid:
-                    face_frame.head_yaw_deg = head_pose_frame.yaw_deg
-                    face_frame.head_pitch_deg = head_pose_frame.pitch_deg
-                    face_frame.head_roll_deg = head_pose_frame.roll_deg
+                # head_pose_frame = self.head_pose_capture.process(head_pose_mp_image, ts)
+                # if head_pose_frame.valid:
+                #     face_frame.head_yaw_deg = head_pose_frame.yaw_deg
+                #     face_frame.head_pitch_deg = head_pose_frame.pitch_deg
+                #     face_frame.head_roll_deg = head_pose_frame.roll_deg
                 if self.recorder is not None:
-                    self.recorder.add(ts, pose_frame, face_frame, hands_frame, head_pose_frame)
+                    self.recorder.add(ts, pose_frame, face_frame, hands_frame)
                 self._update_calibration(pose_frame, face_frame)
-                # Pose before face: the face packet's head channels are moving to the
-                # pose solve's head basis (CLAUDE.md, "Head rotation for the face
-                # channel"). Sent first, they would always trail the body by a frame.
-                self._handle_pose(pose_frame, ts, hands_frame, face_frame)
-                self._handle_face(face_frame, head_valid=head_pose_frame.valid)
+                # Pose before face: the face packet's head channels come from this
+                # frame's pose solve. Sent first, they would trail the body by a frame.
+                solved = self._handle_pose(pose_frame, ts, hands_frame, face_frame)
+                # Head rotation reaches a MetaHuman ONLY through these curves - the body
+                # stream's head is discarded there (CLAUDE.md, "Head rotation - who owns
+                # it"). Sent every frame the body solves, face mesh or not: the solver
+                # carries the head with the torso through face dropouts.
+                head = self.pose_solver.head_rotation if solved else None
+                self._handle_face(face_frame, head_rotation_to_curves(head) if head is not None else None)
 
                 if self.show_debug:
                     key = self._draw_debug(raw_frame, face_frame, pose_frame, hands_frame)
@@ -639,7 +636,7 @@ class Conductor:
                 self.recorder.save()
             self.cap.release()
             self.holistic_capture.close()
-            self.head_pose_capture.close()
+            # self.head_pose_capture.close()  # disabled - see CLAUDE.md
             self.face_socket.close()
             if self.show_debug:
                 cv2.destroyAllWindows()
@@ -647,7 +644,7 @@ class Conductor:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--holistic-model", default="holistic_landmarker.task")
-    parser.add_argument("--head-pose-model", default="face_landmarker.task")
+    # parser.add_argument("--head-pose-model", default="face_landmarker.task")  # disabled - see CLAUDE.md
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=None,
                          help="force a capture width; default picks the highest mode the camera accepts")
@@ -675,18 +672,19 @@ def main() -> None:
                          help="show a combined webcam + tracking-status debug window")
     args = parser.parse_args()
  
-    for label, path in (("Holistic", args.holistic_model), ("Head pose", args.head_pose_model)):
+    # Head pose model check disabled with head_pose_capture - see CLAUDE.md.
+    for label, path in (("Holistic", args.holistic_model),):
         if not Path(path).exists():
             raise FileNotFoundError(
                 f"{label} model not found at {path}. See mediapipe_holistic_capture.py's "
-                "and head_pose_capture.py's module docstrings for download links."
+                "module docstring for the download link."
             )
 
     holistic_capture = MediaPipeHolisticCapture(model_path=args.holistic_model)
-    head_pose_capture = HeadPoseCapture(model_path=args.head_pose_model)
+    # head_pose_capture = HeadPoseCapture(model_path=args.head_pose_model)  # disabled - see CLAUDE.md
 
     conductor = Conductor(
-        holistic_capture, head_pose_capture,
+        holistic_capture,  # head_pose_capture,
         camera_index=args.camera,
         camera_width=args.width, camera_height=args.height,
         torso_lean_offset_deg=args.torso_lean_offset,

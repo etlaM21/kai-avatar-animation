@@ -40,7 +40,8 @@ from PIL import Image, ImageTk
 from mediapipe.tasks.python.vision import drawing_utils
 
 from conductor import Conductor, LIVE_LINK_FACE_PORT, POSE_OSC_PORT
-from head_pose_capture import HeadPoseCapture
+# Disabled, kept on purpose: see CLAUDE.md, "head_pose_capture.py - disabled".
+# from head_pose_capture import HeadPoseCapture
 from mediapipe_holistic_capture import MediaPipeHolisticCapture
 
 # ---- palette --------------------------------------------------------------
@@ -62,7 +63,7 @@ FONT_MONO_BOLD = ("Consolas", 9, "bold")
 FONT_HEADER = ("Segoe UI", 9, "bold")
 
 DEFAULT_HOLISTIC_MODEL = "holistic_landmarker.task"
-DEFAULT_HEAD_POSE_MODEL = "face_landmarker.task"
+# DEFAULT_HEAD_POSE_MODEL = "face_landmarker.task"  # disabled - see CLAUDE.md
 
 
 # ---- cv2 / drawing_utils monkeypatches -------------------------------------
@@ -175,15 +176,16 @@ class PipelineController:
                 min_pose_landmarks_confidence=params["h_min_pose_landmarks"],
                 min_hand_landmarks_confidence=params["h_min_hand_landmarks"],
             )
-            head_pose_capture = HeadPoseCapture(
-                model_path=params["head_pose_model"],
-                min_face_detection_confidence=params["hp_min_face_detection"],
-                min_face_presence_confidence=params["hp_min_face_presence"],
-                min_tracking_confidence=params["hp_min_tracking"],
-            )
+            # head_pose_capture is disabled - see CLAUDE.md.
+            # head_pose_capture = HeadPoseCapture(
+            #     model_path=params["head_pose_model"],
+            #     min_face_detection_confidence=params["hp_min_face_detection"],
+            #     min_face_presence_confidence=params["hp_min_face_presence"],
+            #     min_tracking_confidence=params["hp_min_tracking"],
+            # )
             conductor = Conductor(
                 holistic_capture,
-                head_pose_capture,
+                # head_pose_capture,
                 camera_index=params["camera_index"],
                 camera_width=params["camera_width"],
                 camera_height=params["camera_height"],
@@ -554,9 +556,9 @@ class App:
 
         # --- model paths ---
         self.holistic_model_var = tk.StringVar(value=DEFAULT_HOLISTIC_MODEL)
-        self.head_pose_model_var = tk.StringVar(value=DEFAULT_HEAD_POSE_MODEL)
+        # self.head_pose_model_var = tk.StringVar(value=DEFAULT_HEAD_POSE_MODEL)  # disabled - see CLAUDE.md
         self._add_labeled_entry(body, "Holistic model", self.holistic_model_var)
-        self._add_labeled_entry(body, "Head-pose model", self.head_pose_model_var)
+        # self._add_labeled_entry(body, "Head-pose model", self.head_pose_model_var)
 
         # --- network ---
         self.face_ip_var = tk.StringVar(value="127.0.0.1")
@@ -577,18 +579,19 @@ class App:
         self.h_min_pose_detection_var = tk.DoubleVar(value=0.5)
         self.h_min_pose_landmarks_var = tk.DoubleVar(value=0.5)
         self.h_min_hand_landmarks_var = tk.DoubleVar(value=0.5)
-        self.hp_min_face_detection_var = tk.DoubleVar(value=0.5)
-        self.hp_min_face_presence_var = tk.DoubleVar(value=0.5)
-        self.hp_min_tracking_var = tk.DoubleVar(value=0.5)
+        # Head-pose thresholds disabled with head_pose_capture - see CLAUDE.md.
+        # self.hp_min_face_detection_var = tk.DoubleVar(value=0.5)
+        # self.hp_min_face_presence_var = tk.DoubleVar(value=0.5)
+        # self.hp_min_tracking_var = tk.DoubleVar(value=0.5)
         for label, var in (
             ("Holistic: face detect", self.h_min_face_detection_var),
             ("Holistic: face landmarks", self.h_min_face_landmarks_var),
             ("Holistic: pose detect", self.h_min_pose_detection_var),
             ("Holistic: pose landmarks", self.h_min_pose_landmarks_var),
             ("Holistic: hand landmarks", self.h_min_hand_landmarks_var),
-            ("Head pose: face detect", self.hp_min_face_detection_var),
-            ("Head pose: face presence", self.hp_min_face_presence_var),
-            ("Head pose: tracking", self.hp_min_tracking_var),
+            # ("Head pose: face detect", self.hp_min_face_detection_var),
+            # ("Head pose: face presence", self.hp_min_face_presence_var),
+            # ("Head pose: tracking", self.hp_min_tracking_var),
         ):
             self._add_threshold_spinbox(body, label, var)
 
@@ -668,7 +671,7 @@ class App:
                 camera_width=parse_optional_int(self.camera_width_var.get()),
                 camera_height=parse_optional_int(self.camera_height_var.get()),
                 holistic_model=self.holistic_model_var.get().strip(),
-                head_pose_model=self.head_pose_model_var.get().strip(),
+                # head_pose_model=self.head_pose_model_var.get().strip(),  # disabled - see CLAUDE.md
                 face_ip=self.face_ip_var.get().strip(),
                 face_port=int(self.face_port_var.get()),
                 pose_ip=self.pose_ip_var.get().strip(),
@@ -681,16 +684,17 @@ class App:
                 h_min_pose_detection=float(self.h_min_pose_detection_var.get()),
                 h_min_pose_landmarks=float(self.h_min_pose_landmarks_var.get()),
                 h_min_hand_landmarks=float(self.h_min_hand_landmarks_var.get()),
-                hp_min_face_detection=float(self.hp_min_face_detection_var.get()),
-                hp_min_face_presence=float(self.hp_min_face_presence_var.get()),
-                hp_min_tracking=float(self.hp_min_tracking_var.get()),
+                # hp_min_face_detection=float(self.hp_min_face_detection_var.get()),
+                # hp_min_face_presence=float(self.hp_min_face_presence_var.get()),
+                # hp_min_tracking=float(self.hp_min_tracking_var.get()),
             )
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid input", f"Could not parse a field: {exc}")
             return None
 
         for label, path in (("Holistic model", params["holistic_model"]),
-                             ("Head-pose model", params["head_pose_model"])):
+                             # ("Head-pose model", params["head_pose_model"]),  # disabled - see CLAUDE.md
+                             ):
             if not Path(path).exists():
                 messagebox.showerror("Model not found", f"{label} not found at: {path}")
                 return None

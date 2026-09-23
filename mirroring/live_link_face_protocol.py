@@ -36,6 +36,8 @@ import datetime
 import struct
 import uuid as uuid_module
 
+from scipy.spatial.transform import Rotation
+
 NUM_CHANNELS = 61
 
 # Wire position (0-60), matching Epic's expected order. Indices 0-51 are
@@ -43,7 +45,8 @@ NUM_CHANNELS = 61
 # outputs these exact camelCase names when blendshape output is enabled,
 # so no renaming is needed for those. Indices 52-60 (head/eye rotation)
 # are not part of MediaPipe's blendshape set and must be supplied
-# separately (see conductor.py).
+# separately: head rotation via head_rotation_to_curves() below, eyes not
+# at all yet (see conductor.py).
 CHANNEL_ORDER: list[str] = [
     "eyeBlinkLeft", "eyeLookDownLeft", "eyeLookInLeft", "eyeLookOutLeft",
     "eyeLookUpLeft", "eyeSquintLeft", "eyeWideLeft",
@@ -64,6 +67,32 @@ CHANNEL_ORDER: list[str] = [
     "rightEyeYaw", "rightEyePitch", "rightEyeRoll",
 ]
 assert len(CHANNEL_ORDER) == NUM_CHANNELS
+
+# What the receiving MetaHuman does with headYaw/Pitch/Roll, MEASURED on UE 5.8
+# (tests/ue_head_probe.py --measure) rather than taken from ARKit documentation:
+#   - the curves set neck_02 + head to an ABSOLUTE component-space rotation. The
+#     torso underneath is ignored, and the Body stream's own head never reaches
+#     the visible head at all.
+#   - 50 deg per unit on every axis, linear to at least 75 deg.
+#   - composed pitch * roll * yaw (yaw applied first). Fitted to 0.000 deg; the
+#     other five orders miss by 10-31 deg.
+HEAD_DEG_PER_UNIT = 50.0
+
+
+def head_rotation_to_curves(rotation: Rotation) -> dict[str, float]:
+    """The head's rotation off the rig's rest head, in component space (X = the
+    character's left, Y = forward, Z = up), as Live Link Face head curves.
+
+    Absolute, so this must be the head's FULL orientation, torso included - see
+    PoseSolver.head_rotation. Measured signs: headYaw + turns the head to the
+    character's left (-Z), headPitch + looks up (+X), headRoll + tips the top of
+    the head to the character's right (-Y). Intrinsic 'XYZ' Euler angles are
+    exactly Rx * Ry * Rz, the measured composition; they only degenerate at
+    +-90 deg of roll."""
+    pitch, roll, yaw = rotation.as_euler("XYZ", degrees=True)
+    return {"headYaw": -yaw / HEAD_DEG_PER_UNIT,
+            "headPitch": pitch / HEAD_DEG_PER_UNIT,
+            "headRoll": -roll / HEAD_DEG_PER_UNIT}
 
 
 class LiveLinkFaceEncoder:

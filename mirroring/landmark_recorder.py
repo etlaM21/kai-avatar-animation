@@ -21,7 +21,9 @@ never zeros, so a dropped detection can't masquerade as a pose at the origin):
     rhand_*                     same as lhand_*
     face_valid    (N,)          bool
     face_image    (N, 478, 3)   Holistic face mesh, image-normalised (no world variant exists)
-    head_ypr_deg  (N, 3)        yaw, pitch, roll from HeadPoseCapture (NaN if that pass missed)
+    head_ypr_deg  (N, 3)        yaw, pitch, roll from HeadPoseCapture (NaN if that pass missed;
+                                all NaN while it is disabled - head rotation is now derived
+                                from face_image by the solver, so nothing is lost)
     frame_size    (2,)          capture width, height - needed to un-normalise image x vs y
 """
 
@@ -73,7 +75,9 @@ class LandmarkRecorder:
         self._rows.setdefault(key, []).append(value)
 
     def add(self, t_ms: int, pose_frame: Any, face_frame: Any, hands_frame: Any,
-            head_pose_frame: Any) -> None:
+            head_pose_frame: Any = None) -> None:
+        """head_pose_frame is None while head_pose_capture is disabled (CLAUDE.md);
+        head_ypr_deg is still written, as NaN, so every recording has the same layout."""
         self._push("t_ms", t_ms)
         self._push("pose_valid", bool(pose_frame.valid))
         self._push("pose_world", _fill(pose_frame.world_landmarks if pose_frame.valid else None, N_POSE, 5))
@@ -84,7 +88,7 @@ class LandmarkRecorder:
             self._push(f"{prefix}_image", _fill(hand.landmarks if hand.valid else None, N_HAND, 3))
         self._push("face_valid", bool(face_frame.valid))
         self._push("face_image", _fill(face_frame.landmarks if face_frame.valid else None, N_FACE, 3))
-        if head_pose_frame.valid:
+        if head_pose_frame is not None and head_pose_frame.valid:
             ypr = (head_pose_frame.yaw_deg, head_pose_frame.pitch_deg, head_pose_frame.roll_deg)
         else:
             ypr = (np.nan, np.nan, np.nan)
