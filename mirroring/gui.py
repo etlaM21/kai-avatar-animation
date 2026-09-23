@@ -290,8 +290,15 @@ class LabeledSlider(ttk.Frame):
 # ---- main application --------------------------------------------------------
 
 class App:
-    VIDEO_MIN_W, VIDEO_MIN_H = 400, 300
     FPS_WINDOW = 30
+    MIN_WIDTH = 900
+    MIN_HEIGHT = 240
+    INITIAL_WIDTH = 1150
+    # Assumed until the first frame reveals the real capture aspect.
+    DEFAULT_ASPECT = 16 / 9
+    # Room left on screen for the title bar and taskbar when a tall (4:3) capture
+    # would push the window past the bottom edge.
+    SCREEN_MARGIN_PX = 80
 
     def __init__(self) -> None:
         self.frame_queue: "queue.Queue[object]" = queue.Queue(maxsize=1)
@@ -301,14 +308,26 @@ class App:
         self.root = tk.Tk()
         self.root.title("Mocap Conductor")
         self.root.configure(bg=BG)
-        self.root.geometry("1150x700")
-        self.root.minsize(900, 560)
+        # The HEIGHT is derived, not chosen: it is whatever makes the video pane the
+        # capture's own shape at the current width (_fit_height_to_video), so a 4:3
+        # camera gets a taller window than a 16:9 one and neither is letterboxed.
+        # Only the width is the user's to drag; a free height would just bring the
+        # bars back.
+        self.root.geometry(f"{self.INITIAL_WIDTH}x700")
+        self.root.minsize(self.MIN_WIDTH, 1)
+        self.root.resizable(True, False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._setup_style()
 
         self._frame_times: deque[float] = deque(maxlen=self.FPS_WINDOW)
         self._capture_aspect: float | None = None
+        # What the window was last fitted for, so a fit only runs when the capture
+        # aspect or the window width actually changed.
+        self._fitted_aspect: float | None = None
+        self._fitted_width: int | None = None
+        self._fit_pending: str | None = None
+        self._last_frame = None  # redrawn when the pane resizes between frames
         self._photo_image: ImageTk.PhotoImage | None = None  # keep a reference alive
         self._skeleton_enabled = tk.BooleanVar(value=True)
         self._fps_enabled = tk.BooleanVar(value=True)
@@ -318,6 +337,8 @@ class App:
         self._build_layout()
         set_skeleton_overlay_enabled(self._skeleton_enabled.get())
 
+        self.root.bind("<Configure>", self._on_root_configure)
+        self.root.after_idle(self._fit_height_to_video)
         self.root.after(33, self._poll_frame_queue)
 
     # ---- style --------------------------------------------------------
@@ -373,6 +394,7 @@ class App:
     def _build_layout(self) -> None:
         root_frame = ttk.Frame(self.root, style="TFrame")
         root_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        self._root_frame = root_frame  # its padding is part of the fit's overhead
         root_frame.columnconfigure(0, weight=3)
         root_frame.columnconfigure(1, weight=2)
         root_frame.rowconfigure(0, weight=1)
@@ -383,6 +405,7 @@ class App:
     def _build_video_pane(self, parent: tk.Widget) -> None:
         left = ttk.Frame(parent, style="Panel.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self._video_pane = left  # its rows around the canvas are the fit's overhead
 
         display_row = ttk.Frame(left, style="Panel.TFrame")
         display_row.pack(fill="x", padx=8, pady=(8, 0))
@@ -394,7 +417,10 @@ class App:
             display_row, text="Show FPS", variable=self._fps_enabled,
         ).pack(side="left", padx=(12, 0))
 
-        self.canvas = tk.Canvas(left, bg=BG_INPUT, highlightthickness=0)
+        # height=1: the canvas takes its height from the window (expand), never the
+        # other way round. With Tk's default requested height, a short 16:9 window
+        # would squeeze the status row below it out of view instead.
+        self.canvas = tk.Canvas(left, bg=BG_INPUT, highlightthickness=0, height=1)
         self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
         self._placeholder_text_id = self.canvas.create_text(
             0, 0, text="NO SIGNAL", fill=FG_DIM, font=("Segoe UI", 14), anchor="center",
@@ -410,6 +436,70 @@ class App:
 
     def _on_canvas_resize(self, event) -> None:
         self.canvas.coords(self._placeholder_text_id, event.width // 2, event.height // 2)
+        # Redraw at the new size straight away: an image scaled for a larger pane
+        # would otherwise overhang the edges - i.e. be cropped - until the next frame.
+        if self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
+    # ---- window height follows the capture aspect ----------------------------
+
+    def _on_root_configure(self, event) -> None:
+        # Configure fires for every child widget too, and for the height changes the
+        # fit itself makes; only a new WIDTH (a user drag) needs a refit.
+        if event.widget is self.root and event.width != self._fitted_width:
+            self._schedule_fit()
+
+    def _schedule_fit(self) -> None:
+        # Debounced: a drag delivers a burst of Configure events.
+        if self._fit_pending is not None:
+            self.root.after_cancel(self._fit_pending)
+        self._fit_pending = self.root.after(60, self._fit_height_to_video)
+
+    def _fit_height_to_video(self, passes_left: int = 8) -> None:
+        """Resize the window so the video pane has exactly the capture's aspect at
+        the current width: no letterbox bars, and nothing cropped, since the frame
+        is still only ever scaled to fit (_render_frame).
+
+        Window height = the pane height the aspect asks for + everything stacked
+        around the pane (option rows, status row, padding). That overhead is taken
+        from Tk's REQUESTED sizes, which don't depend on the current window size.
+        Measuring it as window height - pane height instead oscillated: straight
+        after a geometry change the window reports its new height while the pane
+        still reports the old one. The pane WIDTH is measured, since how the width
+        splits between the video and controls columns is grid's call; it only moves
+        when the window is narrowed here, which is re-checked on the next pass. If the
+        fitted window would run off the bottom of the screen (4:3 at a wide window),
+        it gets narrower instead - the image shrinks, it never crops."""
+        if self._fit_pending is not None:
+            self.root.after_cancel(self._fit_pending)
+        self._fit_pending = None
+        aspect = self._capture_aspect or self.DEFAULT_ASPECT
+        self._fitted_aspect = aspect
+        self.root.update_idletasks()  # requested sizes are computed at idle
+        pane_w = self.canvas.winfo_width()
+        win_w, win_h = self.root.winfo_width(), self.root.winfo_height()
+        if pane_w <= 1:  # not laid out yet
+            self._fit_pending = self.root.after(30, self._fit_height_to_video)
+            return
+
+        overhead = (self.root.winfo_reqheight() - self._root_frame.winfo_reqheight()
+                    + self._video_pane.winfo_reqheight() - self.canvas.winfo_reqheight())
+        max_h = self.root.winfo_screenheight() - self.SCREEN_MARGIN_PX
+        new_w, new_h = win_w, overhead + round(pane_w / aspect)
+        if new_h > max_h and win_w > self.MIN_WIDTH:
+            # Narrow by what the excess height costs in pane width. Only part of a
+            # window-width change reaches the pane, so this undershoots; the next
+            # pass measures again and tightens it.
+            new_w = max(self.MIN_WIDTH, win_w - round((new_h - max_h) * aspect))
+        new_h = max(self.MIN_HEIGHT, min(new_h, max_h))
+
+        self._fitted_width = new_w
+        if (new_w, new_h) != (win_w, win_h):
+            self.root.geometry(f"{new_w}x{new_h}")
+            if new_w != win_w and passes_left > 0:
+                # Narrowed: the pane width this fit assumed is now stale. Re-check
+                # once Tk has laid out the new width.
+                self._fit_pending = self.root.after(30, lambda: self._fit_height_to_video(passes_left - 1))
 
     def _build_controls_pane(self, parent: tk.Widget) -> None:
         right = ttk.Frame(parent, style="Panel.TFrame")
@@ -785,8 +875,12 @@ class App:
             self._calibration_applied = False
 
     def _render_frame(self, frame) -> None:
+        self._last_frame = frame
         h, w = frame.shape[:2]
         self._capture_aspect = w / h
+        if self._fitted_aspect is None or abs(self._capture_aspect - self._fitted_aspect) > 1e-3:
+            # New camera or resolution: refit, then this and later frames fill the pane.
+            self._fit_height_to_video()
 
         canvas_w = max(self.canvas.winfo_width(), 1)
         canvas_h = max(self.canvas.winfo_height(), 1)
