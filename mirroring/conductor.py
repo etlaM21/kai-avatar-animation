@@ -94,6 +94,10 @@ _UNRESOLVED_EYE_CHANNELS = (
     "leftEyeYaw", "leftEyePitch", "leftEyeRoll",
     "rightEyeYaw", "rightEyePitch", "rightEyeRoll",
 )
+# Head rotation rides in the face packet but is not face data: it is the same motion
+# the body stream's head carries. So it is held and smoothed on its own, not with
+# the blendshapes - see Conductor._handle_face().
+_HEAD_CHANNELS = ("headYaw", "headPitch", "headRoll")
 
 # Candidate capture modes, highest first. Cameras silently fall back to their
 # nearest supported mode instead of failing, so the only way to know what you
@@ -278,8 +282,12 @@ class Conductor:
         self.face_target = (face_ip, face_port)
         # Neutral default until the first valid face detection arrives.
         self._last_valid_face_values: dict[str, float] = {
-            name: 0.0 for name in FACE_CHANNEL_ORDER
+            name: 0.0 for name in FACE_CHANNEL_ORDER if name not in _HEAD_CHANNELS
         }
+        # Head channels: own hold, own smoother. Its alpha is slaved to the pose
+        # smoother's every frame (see _handle_face), so there is one knob, not two.
+        self.head_smoother = Smoother(alpha=pose_smoothing_alpha)
+        self._last_valid_head_values: dict[str, float] = {name: 0.0 for name in _HEAD_CHANNELS}
  
         # --- pose channel: transform state + network target ---
         # self.pose_smoother = Smoother(alpha=pose_smoothing_alpha)
@@ -315,18 +323,21 @@ class Conductor:
     # ---- per-channel transforms ------------------------------------------
  
     def _face_frame_to_channel_values(self, frame: FaceFrame) -> dict[str, float]:
-        """Turns a FaceFrame into the flat channel dict both the smoother
-        and the encoder work with."""
+        """Turns a FaceFrame's blendshapes into the flat channel dict both the
+        smoother and the encoder work with. Head channels: _head_channel_values()."""
         values = dict(frame.blendshapes)
-        # First-pass scale: degrees -> roughly [-1, 1], the range Live
-        # Link Face expects for head rotation. Already empirically tuned
-        # in head_pose_capture.py's rotation decomposition itself.
-        values["headYaw"] = frame.head_yaw_deg / 90.0
-        values["headPitch"] = frame.head_pitch_deg / 90.0
-        values["headRoll"] = frame.head_roll_deg / 90.0
         for name in _UNRESOLVED_EYE_CHANNELS:
             values[name] = 0.0
         return values
+
+    @staticmethod
+    def _head_channel_values(frame: FaceFrame) -> dict[str, float]:
+        # deg/90 is UNVERIFIED: the source feeding it (head_pose_capture) almost never
+        # detected a face at performance distance, so this scale was never seen working.
+        # Units and signs are what tests/ue_head_probe.py measures.
+        return {"headYaw": frame.head_yaw_deg / 90.0,
+                "headPitch": frame.head_pitch_deg / 90.0,
+                "headRoll": frame.head_roll_deg / 90.0}
  
     def _pose_frame_to_channel_values(self, frame: PoseFrame) -> dict[str, float]:
         """Turns a PoseFrame's world landmarks into the same kind of flat
@@ -345,7 +356,10 @@ class Conductor:
  
     # ---- per-channel send ------------------------------------------------
  
-    def _handle_face(self, frame: FaceFrame) -> None:
+    def _handle_face(self, frame: FaceFrame, head_valid: bool) -> None:
+        """head_valid is separate from frame.valid on purpose: the head rotation's
+        source is not the blendshapes' source, and a face-mesh dropout must not
+        freeze the head along with the expression."""
         if frame.valid:
             raw_values = self._face_frame_to_channel_values(frame)
             self._last_valid_face_values.update(raw_values)
@@ -354,8 +368,16 @@ class Conductor:
             # a dropped detection for a frame or two shouldn't make the
             # face visibly snap to a blank expression.
             raw_values = self._last_valid_face_values
- 
+        if head_valid:
+            self._last_valid_head_values = self._head_channel_values(frame)
+
         smoothed = self.face_smoother.apply(raw_values)
+        # The body stream's head is smoothed with the pose alpha; with its own alpha
+        # this copy would lag by a different amount and the two heads would disagree
+        # whenever the performer moves. Read every frame so the GUI's live pose
+        # slider reaches it without knowing it exists.
+        self.head_smoother.alpha = self.pose_smoother.alpha
+        smoothed.update(self.head_smoother.apply(self._last_valid_head_values))
         packet = self.face_encoder.encode(smoothed)
         self.face_socket.sendto(packet, self.face_target)
  
@@ -596,8 +618,11 @@ class Conductor:
                 if self.recorder is not None:
                     self.recorder.add(ts, pose_frame, face_frame, hands_frame, head_pose_frame)
                 self._update_calibration(pose_frame, face_frame)
-                self._handle_face(face_frame)
+                # Pose before face: the face packet's head channels are moving to the
+                # pose solve's head basis (CLAUDE.md, "Head rotation for the face
+                # channel"). Sent first, they would always trail the body by a frame.
                 self._handle_pose(pose_frame, ts, hands_frame, face_frame)
+                self._handle_face(face_frame, head_valid=head_pose_frame.valid)
 
                 if self.show_debug:
                     key = self._draw_debug(raw_frame, face_frame, pose_frame, hands_frame)
