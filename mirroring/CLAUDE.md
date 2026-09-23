@@ -1,7 +1,7 @@
 # project_kaspar — MediaPipe → Unreal Engine live mocap
 
 Real-time markerless mocap: webcam → MediaPipe → OSC → a custom Live Link source
-driving the UE5 Mannequin (Manny).
+driving the UE5 Mannequin (Manny), and from there a MetaHuman.
 
 `README.md` describes the system as built. This file is the working guide: how to
 run things, what is load-bearing, what must not be re-broken, and what is still open.
@@ -28,17 +28,18 @@ In the debug window: `c` calibrates (see below), `Esc` quits.
 
 ```
 webcam (cv2, MJPG, up to 4K)
-  └─ conductor.py            owns the single shared camera + both detectors,
+  └─ conductor.py            owns the single shared camera + the detector,
      │                       smoothing, debug overlay, recording, all sockets
      ├─ mediapipe_holistic_capture.py   ONE inference pass → pose + face + hands
      │    ├─ PoseFrame  (33 world landmarks, with visibility/presence)
      │    ├─ FaceFrame  (52 ARKit blendshapes + 478 face mesh landmarks)
      │    └─ HandsFrame (21 landmarks × 2 hands)
-     ├─ head_pose_capture.py            second FaceLandmarker, head yaw/pitch/roll
-     │                                  → Live Link Face. SEE WARNING BELOW.
+     ├─ head_pose_capture.py            DISABLED — commented out, see below
      ├─ pose_solver.py        pure math: landmarks in, 60 BoneTransforms out
-     │    └─ live_link_pose_osc_protocol.py → OSC 9001 → MediaPipeLiveLink (UE5)
-     ├─ live_link_face_protocol.py      → UDP 11111 (Epic's stock Live Link Face)
+     │    │                   ALSO the single source of head orientation
+     │    ├─ live_link_pose_osc_protocol.py  → OSC 9001 → MediaPipeLiveLink (UE5)
+     │    └─ live_link_face_protocol.py      → UDP 11111 (Epic's Live Link Face)
+     │                                          blendshapes + head yaw/pitch/roll
      └─ landmark_recorder.py            optional --record dump for offline checks
 ```
 
@@ -54,6 +55,84 @@ MediaPipe is used through the **Tasks API** (`mp.Image`, `.task` model bundles).
 The legacy `mp.solutions` namespace and `mediapipe.framework.formats.landmark_pb2`
 **do not exist** in the installed version. Drawing helpers come from
 `mediapipe.tasks.python.vision`.
+
+## Head rotation — who owns it, and why it is routed this way
+
+This is the least obvious part of the system. Read before touching anything
+head-related in Python or in Unreal.
+
+### The Unreal finding
+
+On a MetaHuman the **visible head is the Face skeletal mesh component, not the Body**.
+`ABP_Face` has three graphs; the first one decides everything:
+
+```
+Body & Face:   Copy Pose From Mesh (Body)  → Base Pose  ┐
+               Input Pose (Face's own anim)→ Blend Pose ├→ Layered blend per bone → InputPose
+                                             weight 1.0 ┘
+Head Movement IK:  Control Rig, gated behind `HeadControlSwitch > 0.5`
+                   AND `Enable Head Movement IK`. MetaHuman Animator only —
+                   a passthrough for us. NOTE: if Live Link Face ever delivers a
+                   curve named HeadControlSwitch, this engages and becomes a second
+                   writer to the head.
+RigLogic:      facial solve. Does not touch head rotation.
+```
+
+The layered blend wins for every bone in its Layer Setup. With `head` inside that
+filter, the Body's head rotation is **discarded** and replaced by whatever the Face
+component's own animation carries — ARKit head rotation when Live Link Face is
+connected, bind pose (identity) when it is not. That is why the MetaHuman's head only
+moved with the ARKit receiver enabled, and why *disabling* the receiver did not help:
+the node still evaluates, it just writes identity.
+
+### The decision
+
+**Send head rotation through the Live Link Face channel**, which the MetaHuman already
+routes to the head correctly, rather than rewiring Epic's asset to listen to the body.
+
+Rationale, in order of weight:
+
+1. **Distribution.** K.ai users should only have to add a Retarget Pose node to the
+   Body AnimBP. No MetaHuman asset gets edited, so nothing breaks when Epic
+   restructures MetaHumans again (they did so substantially at 5.6).
+2. It repairs the Live Link Face head channel, which was independently broken
+   (see below) — one change, two fixes.
+3. Both head signals then derive from the same basis, so they cannot disagree.
+
+The body stream **keeps** its own head rotation. Manny-only and non-MetaHuman targets
+depend on it, and it costs nothing to send.
+
+### The alternative, documented but not taken
+
+Change the `Layered blend per bone` Layer Setup branch root from `head` to the facial
+root bone (`FACIAL_C_FacialRoot`). Facial bones still come from the face animation;
+`head` passes through from the Body. One property, and it works — but it is a
+per-user, per-MetaHuman edit to an Epic asset. Keep this as a README note for users
+who specifically want body-driven head.
+
+## head_pose_capture.py — disabled, kept on purpose
+
+**Comment the module out; do not delete it.** It is the seed of the face-crop
+experiment described under Open items.
+
+Why it was dropped:
+
+- Measured: that standalone `FaceLandmarker` **never detected the face at performance
+  distance** — it only fired while walking up to the laptop, in *both* recordings.
+  Live Link Face's head yaw/pitch/roll was therefore pinned at its initial zero for
+  the whole project. A dead signal into a working path.
+- It cost a full extra inference pass per frame.
+
+Why it might come back: `FaceLandmarker` supports
+`output_facial_transformation_matrixes` — a 4×4 head pose fitted against MediaPipe's
+canonical face model. **`HolisticLandmarker` has no such option** (its options are the
+confidence thresholds plus `output_face_blendshapes` and `output_segmentation_masks`).
+If the landmark-derived basis ever proves fragile under extreme pitch or partial
+occlusion, running this module on a crop around the pose-derived head position
+recovers that fitted matrix. That is the only capability Holistic cannot provide.
+
+Leave the imports, the class and the call sites commented with a pointer to this
+section, so the reinstatement path stays obvious.
 
 ## pose_solver.py — treat with care
 
@@ -118,6 +197,24 @@ a swing leaves roll about the bone axis free:
 - The face mesh is image-normalised only. Scaling x and z by width and y by height
   makes it metrically consistent (verified: z×1.0 keeps the face most rigid).
 
+### Head rotation for the face channel
+
+The head basis already exists — `neck_01`/`head` are solved from the face mesh. The
+face channel needs the **same orientation re-expressed**, not a second solve. Reuse it.
+
+**The conversion is not a passthrough.** The solver's head rotation is relative to the
+rig's rest torso; Live Link Face expects ARKit-style head pose, which is relative to
+the camera. Composing the torso orientation back in is the missing step. Get this
+wrong and the head will look correct while standing square to the camera and drift as
+soon as the performer turns their body — exactly the failure mode that is hardest to
+spot live.
+
+The calibration already captures a neutral head pose (see below). Use it as the zero
+reference for the face channel too, so "neutral" means the same thing in both paths.
+
+Order of work: convert, verify offline against `recordings\*.npz`, and only then look
+at it in Unreal. All of this is testable without a camera or an engine.
+
 ## Acceptance tests
 
 ```powershell
@@ -145,6 +242,16 @@ No camera needed. Checks 1–2 are **asserted** (exit code 1 on failure); check 
 3. **Absolute direction error on real captures** — per-bone 3D direction vs the
    performer, in absolute terms, NOT as an angle-from-spine (which is invariant to
    body roll and hides tilt bugs).
+
+**To add with the head-channel change:**
+
+2e. **Face-channel head round-trip** — a synthetic head pose through the solver and
+   out through `live_link_face_protocol`, recovered to the same yaw/pitch/roll.
+   Include frames where the **torso is turned**, not only square-on; a passthrough bug
+   passes trivially when the body faces the camera.
+2f. **Not-zero regression** — assert the face channel's head values actually vary on a
+   recording with head motion. The old failure was silent: three channels reading zero
+   forever, with everything else working.
 
 **Ground truth in the checks is deliberately independent of the solver's own aim
 tables.** Checking a bone against the same landmark pair the solver aims it by passes
@@ -204,35 +311,46 @@ paths, ports/IPs, confidence thresholds — these mark the panel dirty and enabl
 
 ## Open items
 
+### Next up
+
+- **Head rotation through the face channel.** Described above. Comment out
+  `head_pose_capture.py`, feed Live Link Face's yaw/pitch/roll from the existing
+  face-mesh head basis, add tests 2e and 2f.
+- **Ear/nose fallback head aim — now load-bearing.** Head rotation depends entirely on
+  the face mesh, and the face mesh is lost when the performer turns away. The pose
+  model still reports `LEFT_EAR`/`RIGHT_EAR`/`NOSE` with lowered visibility; blend to
+  an aim from those as face confidence drops, reusing the existing occlusion-gating
+  hysteresis rather than adding a second mechanism. Record a 360° turn first so the
+  dropout point is measured, not guessed.
+
 ### For you (Malte)
 
 - **Test the new solver in UE.** Branch `feature/solver-fixes` is not merged.
   Press "Calibrate upright" once, then: turn and nod your head, rotate your wrists
   palm-up/palm-down, spread and curl your fingers, crouch, and lean out of frame.
-- **Decide who owns head rotation in UE.** The body stream now sends real head
-  rotation. If the MetaHuman Face AnimBP also drives the head from the ARKit solve,
-  they will fight — and since Live Link Face's head rotation is currently always zero
-  (see below), it may simply pin the head. Disable one of them.
-- **Decide about `head_pose_capture.py`.** Measured: that standalone FaceLandmarker
-  **never detects the face at performance distance** (it only fired while walking up
-  to the laptop, in both recordings), so Live Link Face's head yaw/pitch/roll has been
-  stuck at its initial zero the whole time. Options: (a) feed those three channels
-  from the same face-mesh basis the body solve uses, (b) delete the module and save an
-  inference pass per frame, or both.
 - **Record an occlusion clip** if you want the gating thresholds tuned harder: lean
   over the desk until the legs leave frame, step half out of shot, put one arm behind
   your back. Current thresholds come from the incidental leg dropouts in `motion.npz`.
 
 ### Not started
 
-- **Step 4, GUI polish** (skipped on request): the video pane letterboxes heavily, the
-  camera Index field reads 0, and FPS is burned into the frame — a panel label with
-  min/avg would read better.
+- **Distortion layer.** The tracking artefacts (dead head, twisted fingers) are wanted
+  as *art-directable* effects, not as bugs. Decision taken: keep the solver clean and
+  correct, and add distortion downstream — geometric distortions in Unreal (Control Rig
+  node or Transform (Modify) Bone, **after** the retarget, so the IK Retargeter cannot
+  correct them away), and tracking-failure distortions (jitter, dropout, confidence
+  collapse) as an optional module between `pose_solver` and the OSC encoder, off by
+  default. Drive both live over a second OSC address space on the existing
+  `UOSCServer`. Tag the current commit before fixing anything else — some artefacts are
+  emergent and will not reproduce procedurally.
 - **Root translation.** MediaPipe world landmarks are hip-centred, so all global
   movement is discarded *by construction*: the character can never step, shift or
   jump, and ground locking reads a real jump as grounded. This needs image-space
   landmarks or a separate position estimate — an architecture decision, not a tune.
   Probably the biggest remaining gap for a live performance piece.
+- **Face crop experiment.** Reinstate `head_pose_capture.py` on a crop around the
+  pose-derived head position, to recover `output_facial_transformation_matrixes` at
+  performance distance. Only worth it if the landmark-derived basis proves fragile.
 - **Knees converge** — the character's stance is narrower than the performer's
   (~0.65 knee/hip ratio measured earlier). Not investigated this session.
 - **Manny → MetaHuman retargeting** (README §6), and benchmarking Full Body IK vs
