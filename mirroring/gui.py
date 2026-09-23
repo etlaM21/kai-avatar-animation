@@ -63,6 +63,14 @@ FONT_MONO_BOLD = ("Consolas", 9, "bold")
 FONT_HEADER = ("Segoe UI", 9, "bold")
 
 DEFAULT_HOLISTIC_MODEL = "holistic_landmarker.task"
+
+# Smoothing sliders run 0 (raw) .. SMOOTHING_MAX; the smoothers take an EMA alpha,
+# which runs the other way. Never 1.0: that is alpha 0, a channel that never moves.
+SMOOTHING_MAX = 0.99
+
+
+def smoothing_to_alpha(smoothing: float) -> float:
+    return 1.0 - min(max(smoothing, 0.0), SMOOTHING_MAX)
 # DEFAULT_HEAD_POSE_MODEL = "face_landmarker.task"  # disabled - see CLAUDE.md
 
 
@@ -409,6 +417,13 @@ class App:
 
         display_row = ttk.Frame(left, style="Panel.TFrame")
         display_row.pack(fill="x", padx=8, pady=(8, 0))
+        # Camera first: it decides what the pane below shows at all. Changing it
+        # needs a restart, like every other constructor parameter.
+        ttk.Label(display_row, text="Camera", style="Body.TLabel").pack(side="left")
+        self.camera_index_var = tk.IntVar(value=0)
+        ttk.Spinbox(display_row, from_=0, to=9, width=3, textvariable=self.camera_index_var,
+                    command=self._mark_restart_dirty).pack(side="left", padx=(6, 16))
+        self.camera_index_var.trace_add("write", lambda *_: self._mark_restart_dirty())
         ttk.Checkbutton(
             display_row, text="Debug overlay", variable=self._skeleton_enabled,
             command=lambda: set_skeleton_overlay_enabled(self._skeleton_enabled.get()),
@@ -433,6 +448,13 @@ class App:
         ttk.Label(status_row, textvariable=self.status_var, style="Body.TLabel").pack(side="left")
         self.fps_var = tk.StringVar(value="")
         ttk.Label(status_row, textvariable=self.fps_var, style="Mono.TLabel").pack(side="right")
+        # Tracking status next to the FPS - the same POSE/FACE state the debug overlay
+        # burns into the frame, readable here even with the overlay text tiny or off.
+        self.tracking_lbls: dict[str, ttk.Label] = {}
+        for key in ("face", "pose"):  # packed right-to-left: reads POSE  FACE  fps
+            lbl = ttk.Label(status_row, text="", style="Mono.TLabel")
+            lbl.pack(side="right", padx=(0, 12))
+            self.tracking_lbls[key] = lbl
 
     def _on_canvas_resize(self, event) -> None:
         self.canvas.coords(self._placeholder_text_id, event.width // 2, event.height // 2)
@@ -512,7 +534,6 @@ class App:
         # pinned below it, always reachable regardless of scroll position.
         scroll_body = self._make_scrollable(right)
 
-        self._build_camera_group(scroll_body)
         self._build_smoothing_group(scroll_body)
         self._build_calibration_group(scroll_body)
         self._build_advanced_group(scroll_body)
@@ -574,35 +595,28 @@ class App:
 
         return inner
 
-    def _build_camera_group(self, parent: tk.Widget) -> None:
-        group = ttk.LabelFrame(parent, text="Camera")
-        group.pack(fill="x", padx=8, pady=(8, 4))
-
-        row = ttk.Frame(group, style="Panel.TFrame")
-        row.pack(fill="x", padx=8, pady=8)
-        ttk.Label(row, text="Index", style="Body.TLabel").pack(side="left")
-        self.camera_index_var = tk.IntVar(value=0)
-        spin = ttk.Spinbox(row, from_=0, to=9, width=4, textvariable=self.camera_index_var,
-                            command=self._mark_restart_dirty)
-        spin.pack(side="left", padx=(6, 0))
-        self.camera_index_var.trace_add("write", lambda *_: self._mark_restart_dirty())
-
     def _build_smoothing_group(self, parent: tk.Widget) -> None:
         group = ttk.LabelFrame(parent, text="Smoothing")
-        group.pack(fill="x", padx=8, pady=4)
+        group.pack(fill="x", padx=8, pady=(8, 4))
         body = ttk.Frame(group, style="Panel.TFrame")
         body.pack(fill="x", padx=8, pady=8)
 
+        # The sliders show SMOOTHING - 0 = raw, higher = smoother - and send the
+        # smoothers their EMA alpha, which runs the other way (1 = raw). Stops at
+        # SMOOTHING_MAX: alpha 0 would freeze the channel on its first value forever.
+        ttk.Label(body, text="0 = raw, higher = smoother but laggier", style="Dim.TLabel").pack(
+            fill="x", pady=(0, 4))
         self.face_alpha_slider = LabeledSlider(
-            body, "Face", from_=0.01, to=1.0, initial=0.5, on_change=self._set_face_alpha,
+            body, "Face", from_=0.0, to=SMOOTHING_MAX, initial=0.5, on_change=self._set_face_alpha,
         )
         self.face_alpha_slider.pack(fill="x")
 
         # Pose alpha also smooths both hands - PoseSmoother keys purely by
         # bone name and merges body + left hand + right hand into one call,
-        # so there is no separate hand-smoothing knob to expose.
+        # so there is no separate hand-smoothing knob to expose. It also
+        # smooths the face channel's head rotation (conductor slaves it).
         self.pose_alpha_slider = LabeledSlider(
-            body, "Pose & Hands", from_=0.01, to=1.0, initial=0.5, on_change=self._set_pose_alpha,
+            body, "Pose & Hands", from_=0.0, to=SMOOTHING_MAX, initial=0.5, on_change=self._set_pose_alpha,
         )
         self.pose_alpha_slider.pack(fill="x")
 
@@ -612,8 +626,12 @@ class App:
         body = ttk.Frame(group, style="Panel.TFrame")
         body.pack(fill="x", padx=8, pady=8)
 
+        # The button first: it is what gets used, the offset is its readout / override.
+        self.calibrate_btn = ttk.Button(body, text="Calibrate upright", command=self._on_calibrate)
+        self.calibrate_btn.pack(fill="x")
+
         row = ttk.Frame(body, style="Panel.TFrame")
-        row.pack(fill="x")
+        row.pack(fill="x", pady=(8, 0))
         ttk.Label(row, text="Torso lean offset (deg)", style="Body.TLabel").pack(side="left")
         self.torso_lean_var = tk.DoubleVar(value=0.0)
         spin = ttk.Spinbox(
@@ -623,9 +641,6 @@ class App:
         spin.pack(side="right")
         spin.bind("<Return>", lambda _e: self._on_torso_lean_changed())
         spin.bind("<FocusOut>", lambda _e: self._on_torso_lean_changed())
-
-        self.calibrate_btn = ttk.Button(body, text="Calibrate upright", command=self._on_calibrate)
-        self.calibrate_btn.pack(fill="x", pady=(8, 0))
 
     def _build_advanced_group(self, parent: tk.Widget) -> None:
         section = CollapsibleSection(parent, "Advanced", start_expanded=False)
@@ -718,13 +733,13 @@ class App:
 
     # ---- live parameter handlers ------------------------------------------
 
-    def _set_face_alpha(self, value: float) -> None:
+    def _set_face_alpha(self, smoothing: float) -> None:
         if self.controller.conductor is not None:
-            self.controller.conductor.face_smoother.alpha = value
+            self.controller.conductor.face_smoother.alpha = smoothing_to_alpha(smoothing)
 
-    def _set_pose_alpha(self, value: float) -> None:
+    def _set_pose_alpha(self, smoothing: float) -> None:
         if self.controller.conductor is not None:
-            self.controller.conductor.pose_smoother.alpha = value
+            self.controller.conductor.pose_smoother.alpha = smoothing_to_alpha(smoothing)
 
     def _on_torso_lean_changed(self) -> None:
         try:
@@ -766,8 +781,8 @@ class App:
                 face_port=int(self.face_port_var.get()),
                 pose_ip=self.pose_ip_var.get().strip(),
                 pose_port=int(self.pose_port_var.get()),
-                face_smoothing_alpha=float(self.face_alpha_slider.var.get()),
-                pose_smoothing_alpha=float(self.pose_alpha_slider.var.get()),
+                face_smoothing_alpha=smoothing_to_alpha(float(self.face_alpha_slider.var.get())),
+                pose_smoothing_alpha=smoothing_to_alpha(float(self.pose_alpha_slider.var.get())),
                 torso_lean_offset_deg=float(self.torso_lean_var.get()),
                 h_min_face_detection=float(self.h_min_face_detection_var.get()),
                 h_min_face_landmarks=float(self.h_min_face_landmarks_var.get()),
@@ -860,7 +875,18 @@ class App:
             self._clear_restart_dirty()
 
         self._poll_calibration()
+        self._poll_tracking()
         self.root.after(33, self._poll_frame_queue)
+
+    def _poll_tracking(self) -> None:
+        conductor = self.controller.conductor
+        for key, lbl in self.tracking_lbls.items():
+            if conductor is None or not self.controller.is_running:
+                lbl.configure(text="")
+                continue
+            tracking = getattr(conductor, f"{key}_tracking", False)
+            lbl.configure(text=f"{key.upper()} {'TRACKING' if tracking else 'SEARCHING'}",
+                          foreground=ACCENT if tracking else ERROR)
 
     def _poll_calibration(self) -> None:
         """Mirror a running timed calibration into the lean spinbox once it lands.

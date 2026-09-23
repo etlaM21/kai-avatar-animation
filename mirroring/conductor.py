@@ -316,6 +316,10 @@ class Conductor:
         # Last CalibrationState while a timed calibration runs, else None. Read by the
         # debug overlay and polled by the GUI.
         self.calibration_state: CalibrationState | None = None
+        # Whether the latest frame had a pose / a face. The same thing the debug
+        # overlay burns into the frame, kept as data so the GUI can show it too.
+        self.pose_tracking = False
+        self.face_tracking = False
  
     # ---- timing ---------------------------------------------------------
  
@@ -603,6 +607,7 @@ class Conductor:
                 # head_pose_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
                 pose_frame, face_frame, hands_frame = self.holistic_capture.process(holistic_mp_image, ts)
+                self.pose_tracking, self.face_tracking = pose_frame.valid, face_frame.valid
                 # head_pose_frame = self.head_pose_capture.process(head_pose_mp_image, ts)
                 # if head_pose_frame.valid:
                 #     face_frame.head_yaw_deg = head_pose_frame.yaw_deg
