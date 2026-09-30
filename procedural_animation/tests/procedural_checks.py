@@ -18,6 +18,11 @@ procedural-animation.md sec. 5, tests 1-3:
    (+Z) moves Manny along +Y facing +Y; a 90 deg turn to the character's left
    faces Manny +X (a transposed/inverted rotation faces -X); raising the source's
    left arm raises upperarm_l and leaves the right arm alone.
+4. Head channel. The Live Link Face curves the conductor sends, decoded the way
+   the MetaHuman applies them (float32, 50 deg per unit, pitch * roll * yaw), give
+   back the head that the sent body pose puts on Manny - every frame of every clip.
+5. Wire format. What LiveLinkPoseOSCEncoder actually emits for a sampled pose:
+   address /mediapipe/pose, 421 floats, bones in conductor.py's order.
 
 Ground truth is deliberately independent of retarget.py: Manny positions come
 from an Unreal-style FK written here over the streamed BoneTransforms (rotators
@@ -46,7 +51,9 @@ from procedural_animation.retarget import STREAMED_BONES, Retargeter, Retargeted
 from procedural_animation.source_skeletons import (  # noqa: E402
     SOMA77_TPOSE_BVH, load_soma77, to_standard_convention,
 )
-from pose_solver import FINGER_CHAIN, FULL_CHAIN, ue_rotator_to_dict  # noqa: E402
+from pose_solver import BONE_NAMES, FINGER_BONE_NAMES, FINGER_CHAIN, FULL_CHAIN, ue_rotator_to_dict  # noqa: E402
+from live_link_face_protocol import HEAD_DEG_PER_UNIT, head_rotation_to_curves  # noqa: E402
+from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder  # noqa: E402
 
 CLIP_DIRS = [MODULE_ROOT / "pipeline-network-editor" / "kimodo-gen", MODULE_ROOT / "kimodo" / "kimodo-gen"]
 
@@ -93,6 +100,9 @@ GEOMETRY_SEGMENTS = [("neck_01", "head"), ("hand_l", "middle_01_l"), ("hand_r", 
     (p, n) for n, p, _r, _o in FINGER_CHAIN if p in ("hand_l", "hand_r")]
 
 TOL_DIR_DEG = 1e-3
+# Head curves travel as float32 (1 unit = 50 deg), so a correct round trip lands
+# within ~1e-5 deg; a wrong sign, axis or composition order misses by degrees.
+TOL_HEAD_CHANNEL_DEG = 0.01
 # Orientation measures (hip line, palm normals) carry a constant rig-geometry offset
 # too, but that offset must not CHANGE with the motion: if roll were lost, it would.
 # Measured drift from the rest value over all 28 standard clips: <= 0.04 deg.
@@ -114,8 +124,14 @@ def manny_fk(motion: RetargetedMotion) -> dict[str, np.ndarray]:
     """(T, 3) component-space position of every Manny joint, the way Unreal builds
     it: streamed local rotation where the bone is in the packet, bind rotation
     otherwise (spine_03, spine_05, neck_02), rig offsets, streamed pelvis position."""
-    T = motion.num_frames
-    streamed = {name: k for k, name in enumerate(STREAMED_BONES)}
+    return manny_fk_full(motion)[0]
+
+
+def manny_fk_full(motion: RetargetedMotion | None) -> tuple[dict[str, np.ndarray], dict[str, R]]:
+    """manny_fk plus every joint's (T,) global rotation. None = Manny's bind pose
+    (one frame), built from the rig dump alone."""
+    T = 1 if motion is None else motion.num_frames
+    streamed = {} if motion is None else {name: k for k, name in enumerate(STREAMED_BONES)}
     glob: dict[str, R] = {}
     pos: dict[str, np.ndarray] = {}
     chain = [(n, (FULL_CHAIN[p][0] if p >= 0 else None), rot, off) for n, p, rot, off in FULL_CHAIN]
@@ -125,11 +141,12 @@ def manny_fk(motion: RetargetedMotion) -> dict[str, np.ndarray]:
                  else R.from_quat(np.tile(_bind(rot), (T, 1))))
         if parent is None:
             glob[name] = local
-            pos[name] = motion.pelvis_pos.copy()
+            pos[name] = (np.tile(np.asarray(off, dtype=float), (T, 1)) if motion is None
+                         else motion.pelvis_pos.copy())
         else:
             glob[name] = glob[parent] * local
             pos[name] = pos[parent] + glob[parent].apply(np.asarray(off, dtype=float))
-    return pos
+    return pos, glob
 
 
 def source_fk(clip: BvhClip) -> dict[str, np.ndarray]:
@@ -244,7 +261,8 @@ def check_rest(rt: Retargeter, rep: Report) -> dict[str, float]:
 def check_clips(rt: Retargeter, paths: list[Path], rest: dict[str, float], rep: Report) -> None:
     """Truth is always the ORIGINAL file's FK, so a native clip's conversion to the
     standard convention is checked by the same measures as the retarget itself."""
-    print("\n2. Direction truth on real clips")
+    print("\n2. Direction truth on real clips (and 4. head channel)")
+    rest_head = manny_fk_full(None)[1]["head"][0]
     groups: dict[str, list[tuple[Path, BvhClip, BvhClip]]] = {"standard": [], "native": []}
     other: list[tuple[Path, str]] = []
     for path in paths:
@@ -273,11 +291,15 @@ def check_clips(rt: Retargeter, paths: list[Path], rest: dict[str, float], rep: 
             continue
         print(f"  -- {convention} convention --")
         worst_seg, worst_seg_where, frames = 0.0, "", 0
+        worst_head, worst_head_where = 0.0, ""
         roll_all: dict[str, list[np.ndarray]] = {k: [] for k in REPORTED}
         for path, raw, clip in items:
             motion = rt.retarget_clip(clip)
             err = compare(manny_fk(motion), source_fk(raw), motion)
             frames += clip.num_frames
+            e = head_channel_error(motion, rest_head)
+            if e > worst_head:
+                worst_head, worst_head_where = e, path.name
             for a, b in LIMB_SEGMENTS + FINGER_SEGMENTS:
                 e = float(err[f"{a}->{b}"].max())
                 if e > worst_seg:
@@ -287,6 +309,9 @@ def check_clips(rt: Retargeter, paths: list[Path], rest: dict[str, float], rep: 
         rep.check(worst_seg < TOL_DIR_DEG,
                   f"{len(LIMB_SEGMENTS) + len(FINGER_SEGMENTS)} bones x {frames} frames ({len(items)} clips): "
                   f"worst {worst_seg:.5f} deg" + (f" ({worst_seg_where})" if worst_seg >= TOL_DIR_DEG else ""))
+        rep.check(worst_head < TOL_HEAD_CHANNEL_DEG,
+                  f"4. face-channel head decodes to the sent body's head: worst {worst_head:.5f} deg"
+                  + (f" ({worst_head_where})" if worst_head >= TOL_HEAD_CHANNEL_DEG else ""))
         for k in DRIFT_ASSERTED:
             drift = float(np.abs(np.concatenate(roll_all[k]) - rest[k]).max())
             rep.check(drift < TOL_ROLL_DRIFT_DEG,
@@ -358,6 +383,59 @@ def check_change_of_basis(rt: Retargeter, rep: Report) -> None:
     rep.check(moved < 1e-6, f"right arm untouched by the left-arm raise: {moved:.2e} cm")
 
 
+# ---------------------------------------------------------------------------
+# 4. Head channel
+# ---------------------------------------------------------------------------
+
+def head_channel_error(motion: RetargetedMotion, rest_head: R) -> float:
+    """Worst angle, over the clip, between the head the face curves put on the
+    MetaHuman and the head the streamed body pose puts on Manny (independent FK).
+    The decode inverts the measured behaviour stated in live_link_face_protocol:
+    float32 on the wire, HEAD_DEG_PER_UNIT per unit, composed pitch * roll * yaw,
+    headYaw + = -Z, headPitch + = +X, headRoll + = -Y."""
+    _pos, glob = manny_fk_full(motion)
+    sent = glob["head"] * rest_head.inv()
+    angles = np.zeros((motion.num_frames, 3))
+    for k in range(motion.num_frames):
+        c = head_rotation_to_curves(motion.head_rotation[k])
+        yaw, pitch, roll = (float(np.float32(c[n])) * HEAD_DEG_PER_UNIT
+                            for n in ("headYaw", "headPitch", "headRoll"))
+        angles[k] = (pitch, -roll, -yaw)
+    decoded = R.from_euler("XYZ", angles, degrees=True)
+    return float(np.degrees((decoded.inv() * sent).magnitude()).max())
+
+
+# ---------------------------------------------------------------------------
+# 5. Wire format
+# ---------------------------------------------------------------------------
+
+class _CaptureClient:
+    """Stands in for the encoder's SimpleUDPClient: records instead of sending."""
+    address: str = ""
+    args: list = []
+
+    def send_message(self, address: str, args: list) -> None:
+        self.address, self.args = address, list(args)
+
+
+def check_wire(rt: Retargeter, rep: Report) -> None:
+    print("\n5. Wire format")
+    motion = rt.retarget_clip(synthetic_clip(2))
+    bones, _head = motion.sample(0.5 / motion.fps)   # what the conductor sends: a sampled pose
+    encoder = LiveLinkPoseOSCEncoder()
+    capture = _CaptureClient()
+    encoder.client = capture
+    encoder.send(bones, present=True)
+    order = [b.name for b in bones]
+    # conductor.py sends raw_bones + left_bones + right_bones, each hand being
+    # FINGER_BONE_NAMES filtered by side (pose_solver._solve_one_hand).
+    expected = (list(BONE_NAMES) + [n for n in FINGER_BONE_NAMES if n.endswith("_l")]
+                + [n for n in FINGER_BONE_NAMES if n.endswith("_r")])
+    rep.check(capture.address == "/mediapipe/pose", f"OSC address {capture.address!r}")
+    rep.check(len(capture.args) == 1 + 7 * 60, f"{len(capture.args)} floats per packet (expected 421)")
+    rep.check(order == expected, "60 bones in conductor.py's order (22 body, 19 left hand, 19 right hand)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("clips", nargs="*", type=Path)
@@ -368,8 +446,9 @@ def main() -> int:
     rep = Report()
     rest = check_rest(rt, rep)
     check_change_of_basis(rt, rep)
+    check_wire(rt, rep)
     check_clips(rt, paths, rest, rep)
-    print(f"\n{'ALL PASS' if not rep.failures else f'{rep.failures} FAILURE(S)'} (tests 1-3; geometry offsets are a report)")
+    print(f"\n{'ALL PASS' if not rep.failures else f'{rep.failures} FAILURE(S)'} (tests 1-5; geometry offsets are a report)")
     return 1 if rep.failures else 0
 
 
