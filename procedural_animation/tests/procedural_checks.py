@@ -23,6 +23,19 @@ procedural-animation.md sec. 5, tests 1-3:
    back the head that the sent body pose puts on Manny - every frame of every clip.
 5. Wire format. What LiveLinkPoseOSCEncoder actually emits for a sampled pose:
    address /mediapipe/pose, 421 floats, bones in conductor.py's order.
+5b. Player (remote_kimodo_service.player), real time, packets captured: a lone clip
+   loops, a queued clip takes over at the end of the current pass, every packet is
+   421 floats, present=1 while playing and 0 on stop, ~60 Hz.
+
+Remote Kimodo lane (CLAUDE.md, procedural tests 6-7), no Spark needed:
+6. Client resilience against a closed port and stub servers: refused, accept-and-close
+   (the SSH tunnel with no service behind it), no answer, HTTP 500, a malformed NPZ.
+   Each gives a one-line error, caches nothing, and the player keeps sending. A cache
+   hit never touches the network. Inline prompt options parse.
+7. NPZ contract: a clip built from a BVH (either convention) retargets identically via
+   the NPZ and via the BVH; exactly the documented keys/shapes/dtypes, in metres; and
+   transposed rotations, cm instead of m, a different joint order, NaN, a missing key
+   and truncated bytes are all refused.
 
 Ground truth is deliberately independent of retarget.py: Manny positions come
 from an Unreal-style FK written here over the streamed BoneTransforms (rotators
@@ -35,8 +48,12 @@ mis-wired rotation shows up as a direction error.
 from __future__ import annotations
 
 import argparse
+import io
 import math
+import socket
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +71,14 @@ from procedural_animation.source_skeletons import (  # noqa: E402
 from pose_solver import BONE_NAMES, FINGER_BONE_NAMES, FINGER_CHAIN, FULL_CHAIN, ue_rotator_to_dict  # noqa: E402
 from live_link_face_protocol import HEAD_DEG_PER_UNIT, head_rotation_to_curves  # noqa: E402
 from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder  # noqa: E402
+from procedural_animation.procedural_conductor import Lane, parse_prompt  # noqa: E402
+from remote_kimodo_service import kimodo_contract as contract  # noqa: E402
+from remote_kimodo_service.clip_cache import ClipCache  # noqa: E402
+from remote_kimodo_service.fake_kimodo_server import FakeKimodo, clip_from_bvh  # noqa: E402
+from remote_kimodo_service.kimodo_adapter import retarget as retarget_npz  # noqa: E402
+from remote_kimodo_service.kimodo_client import GenerationFailed, KimodoClient, SparkUnavailable  # noqa: E402
+from remote_kimodo_service.kimodo_contract import ContractError, GenerationRequest  # noqa: E402
+from remote_kimodo_service.player import LoopPlayer, Sender  # noqa: E402
 
 CLIP_DIRS = [MODULE_ROOT / "pipeline-network-editor" / "kimodo-gen", MODULE_ROOT / "kimodo" / "kimodo-gen"]
 
@@ -436,6 +461,231 @@ def check_wire(rt: Retargeter, rep: Report) -> None:
     rep.check(order == expected, "60 bones in conductor.py's order (22 body, 19 left hand, 19 right hand)")
 
 
+# ---------------------------------------------------------------------------
+# 5b. Player (remote_kimodo_service.player)
+# ---------------------------------------------------------------------------
+
+class _PacketLog:
+    """Stands in for SimpleUDPClient inside a real Sender: every packet the player sends."""
+    def __init__(self) -> None:
+        self.packets: list[tuple[float, list]] = []
+
+    def send_message(self, address: str, args: list) -> None:
+        self.packets.append((time.perf_counter(), list(args)))
+
+
+def _capturing_sender() -> tuple[Sender, _PacketLog]:
+    sender = Sender(face=False)
+    log = _PacketLog()
+    sender.pose.client = log
+    return sender, log
+
+
+def _short_motion(rt: Retargeter, frames: int, lift_deg: float = 0.0) -> RetargetedMotion:
+    clip = synthetic_clip(frames)
+    if lift_deg:
+        clip.local_rot[clip.index("LeftArm")] = R.from_euler("z", np.full((frames, 1), lift_deg), degrees=True)
+    return rt.retarget_clip(clip)
+
+
+def check_player(rt: Retargeter, rep: Report) -> None:
+    print("\n5b. Player (loop, hand-over at the end of a pass, packets)")
+    a = _short_motion(rt, 9)                 # 0.3 s at 30 fps
+    b = _short_motion(rt, 9, lift_deg=60.0)  # distinguishable: left arm raised
+    starts: list[tuple[float, str]] = []
+
+    sender, log = _capturing_sender()
+    player = LoopPlayer(sender, loop=True, on_start=lambda c: starts.append((time.perf_counter(), c.label)))
+    player.enqueue(a, "A")
+    player.start()
+    time.sleep(0.75)
+    rep.check(player.passes >= 2 and player.current.label == "A",
+              f"a lone clip loops: {player.passes} passes of A in 0.75 s")
+    t_enq = time.perf_counter()
+    player.enqueue(b, "B")
+    time.sleep(0.5)
+    b_start = next((t for t, lab in starts if lab == "B"), None)
+    rep.check(b_start is not None and 0.0 <= b_start - t_enq <= a.duration_s + 0.05,
+              f"queued clip takes over at the end of the current pass "
+              f"({'never' if b_start is None else f'{(b_start - t_enq) * 1e3:.0f} ms after enqueue'}, pass is "
+              f"{a.duration_s * 1e3:.0f} ms)")
+    player.stop()
+    lens = {len(args) for _t, args in log.packets}
+    rep.check(lens == {421}, f"every packet is 421 floats ({len(log.packets)} packets, lengths {sorted(lens)})")
+    rep.check(all(args[0] == 1.0 for _t, args in log.packets[:-1]) and log.packets[-1][1][0] == 0.0,
+              "present=1 while playing, the last packet on stop is present=0")
+    gaps = np.diff([t for t, _a in log.packets[:-1]])
+    rep.check(len(gaps) > 0 and float(np.median(gaps)) < 1.5 / 60.0,
+              f"sends at ~60 Hz (median gap {np.median(gaps) * 1e3:.1f} ms, worst lateness "
+              f"{player.max_late_s * 1e3:.1f} ms)")
+
+    sender, log = _capturing_sender()
+    player = LoopPlayer(sender, loop=False)
+    player.enqueue(a, "A")
+    player.start()
+    done = player.finished.wait(2.0)
+    player.stop()
+    rep.check(done, "loop=False: plays the clip once, then reports finished")
+
+
+# ---------------------------------------------------------------------------
+# 6. Client resilience (no Spark: stub servers and a closed port)
+# ---------------------------------------------------------------------------
+
+def _closed_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def check_client(rt: Retargeter, rep: Report) -> None:
+    print("\n6. Client resilience")
+    req = GenerationRequest.build("A person waves", seed=0, seconds=1.0)
+
+    def outcome(fn) -> tuple[str, str, float]:
+        t0 = time.perf_counter()
+        try:
+            fn()
+            return "ok", "", time.perf_counter() - t0
+        except (SparkUnavailable, GenerationFailed, ContractError) as e:
+            return type(e).__name__, str(e), time.perf_counter() - t0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = ClipCache(Path(tmp) / "cache")
+        # Windows retries a SYN to a closed localhost port and reports refused after
+        # 2.05 s (measured), so the timeout must be longer for "refused" to show.
+        refused = Lane(KimodoClient(f"http://127.0.0.1:{_closed_port()}", timeout=5.0), cache, rt)
+
+        # The player keeps sending through every failure below.
+        sender, log = _capturing_sender()
+        player = LoopPlayer(sender, loop=True)
+        player.enqueue(_short_motion(rt, 9), "A")
+        player.start()
+        before = len(log.packets)
+
+        kind, msg, _ = outcome(lambda: refused.fetch(req))
+        rep.check(kind == "SparkUnavailable" and "refused" in msg, f"closed port -> {kind}: {msg[:70]}")
+        with FakeKimodo(mode="close") as fake:
+            kind, msg, _ = outcome(lambda: Lane(KimodoClient(fake.url), cache, rt).fetch(req))
+        rep.check(kind == "SparkUnavailable", f"accept-and-close (tunnel up, service down) -> {kind}: {msg[:60]}")
+        with FakeKimodo(mode="slow", delay_s=3.0) as fake:
+            kind, msg, dt = outcome(lambda: Lane(KimodoClient(fake.url, timeout=0.5), cache, rt).fetch(req))
+        rep.check(kind == "SparkUnavailable" and dt < 2.0, f"no answer -> {kind} after {dt:.2f} s (timeout 0.5 s)")
+        with FakeKimodo(mode="error") as fake:
+            kind, msg, _ = outcome(lambda: Lane(KimodoClient(fake.url), cache, rt).fetch(req))
+        rep.check(kind == "GenerationFailed" and "500" in msg, f"HTTP 500 -> {kind}: {msg[:60]}")
+        with FakeKimodo(mode="garbage") as fake:
+            kind, msg, _ = outcome(lambda: Lane(KimodoClient(fake.url), cache, rt).fetch(req))
+        rep.check(kind == "ContractError" and not cache.entries(), f"malformed NPZ -> {kind}, nothing cached")
+
+        time.sleep(0.1)
+        rep.check(player._thread.is_alive() and len(log.packets) > before + 10,
+                  f"player kept sending through all of it ({len(log.packets) - before} packets)")
+        player.stop()
+
+        with FakeKimodo(mode="ok") as fake:
+            lane = Lane(KimodoClient(fake.url), cache, rt)
+            kind, msg, _ = outcome(lambda: lane.fetch(req))
+            health = lane.client.health()
+            n_live = fake.requests
+        rep.check(kind == "ok" and len(cache.entries()) == 1, f"a good answer is played and cached ({kind})")
+        rep.check(health.get("loaded") is True, "/health answers through the client")
+        kind, msg, _ = outcome(lambda: refused.fetch(req))
+        rep.check(kind == "ok", f"cache hit with the Spark unreachable -> {kind} (network not touched)")
+        rep.check(n_live == 2, f"the stub saw exactly one generate + one health ({n_live} requests)")
+
+    cases = {"A person walks /s 25": (25, 0, 270), "A person walks /seed 7 /t 4": (100, 7, 120),
+             "walks and/or runs": (100, 0, 270)}
+    ok = all((r.steps, r.seed, r.num_frames) == exp and "/" not in r.prompt.replace("and/or", "")
+             for line, exp in cases.items() for r in [parse_prompt(line, 9.0, 100, 0, contract.DEFAULT_MODEL)])
+    bad = []
+    for line in ("walks /x 3", "walks /t 11", "walks /s zero", "/s 5"):
+        try:
+            parse_prompt(line, 9.0, 100, 0, contract.DEFAULT_MODEL)
+        except ValueError:
+            bad.append(line)
+    rand = {parse_prompt("walks /seed random", 9.0, 100, 0, contract.DEFAULT_MODEL).seed for _ in range(5)}
+    rep.check(ok and len(bad) == 4 and len(rand) > 1,
+              "inline prompt options: /s, /seed N|random, /t parsed; unknown, too long, non-numeric, empty refused")
+
+
+# ---------------------------------------------------------------------------
+# 7. NPZ contract
+# ---------------------------------------------------------------------------
+
+def check_contract(rt: Retargeter, paths: list[Path], rep: Report) -> None:
+    print("\n7. NPZ contract")
+    sk = rt.source
+    picked: dict[str, Path] = {}
+    for p in paths:
+        _c, conv = to_standard_convention(read_bvh(p), sk)
+        picked.setdefault(conv, p)
+        if len(picked) == 2:
+            break
+    for conv, p in sorted(picked.items()):
+        raw = read_bvh(p)
+        data = contract.pack(clip_from_bvh(raw, {"prompt": p.stem}))
+        clip = contract.unpack(data)
+        motion, adapted = retarget_npz(clip, rt)
+        ref = rt.retarget_clip(to_standard_convention(raw, sk)[0])
+        dq = float(np.degrees(np.max((R.from_quat(motion.local_quats.reshape(-1, 4)).inv()
+                                      * R.from_quat(ref.local_quats.reshape(-1, 4))).magnitude())))
+        dp = float(np.abs(motion.pelvis_pos - ref.pelvis_pos).max())
+        rep.check(adapted.convention == conv and dq < 1e-3 and dp < 1e-3,
+                  f"{p.name} ({conv}) via NPZ == via BVH: {dq:.5f} deg, pelvis {dp:.5f} cm "
+                  f"(FK self-check {adapted.fk_error_cm:.4f} cm)")
+
+    with np.load(io.BytesIO(data), allow_pickle=False) as z:
+        keys = {k: (z[k].shape, z[k].dtype.kind) for k in z.files}
+    T = clip.num_frames
+    expected = {"global_rot_mats": ((T, 77, 3, 3), "f"), "root_positions": ((T, 3), "f"),
+                "posed_joints": ((T, 77, 3), "f"), "foot_contacts": ((T, 4), "f"), "fps": ((), "f"),
+                "bone_order_names": ((77,), "U"), "meta_json": ((), "U")}
+    rep.check(keys == expected, "documented keys, shapes and dtypes, nothing else")
+    hips_top = float(clip.posed_joints[:, 0, 1].max())
+    rep.check(0.5 < hips_top < 2.0, f"positions are metres (highest Hips {hips_top:.2f} m)")
+
+    def refused(mutate) -> bool:
+        c = contract.unpack(data)
+        mutate(c)
+        try:
+            retarget_npz(contract.unpack(contract.pack(c)), rt)
+            return False
+        except ContractError:
+            return True
+
+    def drop_key() -> bool:
+        buf = io.BytesIO()
+        with np.load(io.BytesIO(data), allow_pickle=False) as z:
+            np.savez_compressed(buf, **{k: z[k] for k in z.files if k != "posed_joints"})
+        try:
+            contract.unpack(buf.getvalue())
+            return False
+        except ContractError:
+            return True
+
+    checks = {
+        "transposed rotations": lambda c: setattr(c, "global_rot_mats", np.swapaxes(c.global_rot_mats, -1, -2)),
+        "positions in cm instead of m": lambda c: setattr(c, "posed_joints", c.posed_joints * 100.0),
+        "joints in another order": lambda c: setattr(c, "bone_order_names", c.bone_order_names[::-1]),
+        "NaN in a rotation": lambda c: c.global_rot_mats.__setitem__((0, 3, 0, 0), np.nan),
+    }
+    results = {name: refused(fn) for name, fn in checks.items()}
+    results["a missing key"] = drop_key()
+    results["truncated bytes"] = _raises(lambda: contract.unpack(data[: len(data) // 2]))
+    rep.check(all(results.values()), "refused: " + ", ".join(f"{k} {'yes' if v else 'NO'}" for k, v in results.items()))
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+        return False
+    except ContractError:
+        return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("clips", nargs="*", type=Path)
@@ -447,8 +697,11 @@ def main() -> int:
     rest = check_rest(rt, rep)
     check_change_of_basis(rt, rep)
     check_wire(rt, rep)
+    check_player(rt, rep)
+    check_client(rt, rep)
+    check_contract(rt, paths, rep)
     check_clips(rt, paths, rest, rep)
-    print(f"\n{'ALL PASS' if not rep.failures else f'{rep.failures} FAILURE(S)'} (tests 1-5; geometry offsets are a report)")
+    print(f"\n{'ALL PASS' if not rep.failures else f'{rep.failures} FAILURE(S)'} (tests 1-7; geometry offsets are a report)")
     return 1 if rep.failures else 0
 
 

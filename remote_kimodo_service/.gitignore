@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# every generated clip lands here; the local library, not versioned
+cache/
+# written by kimodo_service.py on the Spark
+timing_log.txt
