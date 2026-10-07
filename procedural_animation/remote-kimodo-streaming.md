@@ -5,6 +5,29 @@ into `procedural_conductor` / `conductor.py` / the GUI / Unreal. Written
 2026-09-29, while the Spark is still at the university and is about to move to a
 colleague's home.
 
+> **Status, 2026-10-07: built and working — option A over transport E.** The Spark runs
+> `remote_kimodo_service/kimodo_service.py` bound to `127.0.0.1:8765`; the laptop
+> reaches it through `ssh -N -L 8765:127.0.0.1:8765 ...`; clips come back as NPZ, are
+> cached and played locally at 60 Hz. Full walkthrough: `mirroring/README.md` §9.
+>
+> What changed since this analysis:
+> - **The Spark moved** out of the Filmuniversität network (hostname `kaspar`). The link
+>   is now **direct**: `tailscale ping` `via 5.61.145.75:17793 in 35ms`, netcheck
+>   `MappingVariesByDestIP: false`. §1 describes the old, relayed state. The design
+>   still assumes a relay could come back.
+> - **Measured** (§5 asked for it): a 9 s clip is ~890 KB as compressed NPZ (float32
+>   rotations barely compress) and transfers in 0.3–1.3 s through the tunnel.
+>   Generation on the GB10: 5.8 s at 100 steps (warm), 2.9 s at 50, 1.5 s at 25,
+>   0.7 s at 10. `/health` round trip 76 ms.
+> - **Open questions in §6, answered:** the step-count speed is the table above; the
+>   laptop's hard NAT is gone after the move; whether the other tailnet's ACL allows
+>   non-SSH ports (check 1) is still untested, because the tunnel made it unnecessary;
+>   the show-day fallback is the disk cache (every returned clip, offline `/play N`).
+> - Two traps found while building the client: over `ssh -L`, a stopped service shows
+>   up as "accepted and closed", not "refused" (refused = the tunnel itself is down);
+>   on Windows, a refused localhost connection takes 2.05 s to report.
+> - The tunnel is started by hand and re-run if it drops (no restart loop so far).
+
 **Short answer:**
 - **Windows asks, the Spark answers.** A small HTTP service on the Spark takes a
   prompt and returns the **whole clip as an NPZ**. Windows starts every

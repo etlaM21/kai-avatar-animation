@@ -5,6 +5,16 @@ as an NPZ, is cached on disk, retargeted onto Manny with the existing tested ret
 and played at 60 Hz into Unreal through the same OSC 9001 / UDP 11111 channels the
 webcam lane uses.
 
+**Status:** working end to end since 2026-10-07 (drives the MetaHuman). This is the
+short operator's guide; every stage is explained in detail in
+`mirroring/README.md` §9.
+
+| Measured on the GB10, 9 s clip | |
+|---|---|
+| generation, 100 / 50 / 25 / 10 steps | 5.8 s (7.3 s first request) / 2.9 s / 1.5 s / 0.7 s |
+| transfer of the ~890 KB NPZ, through the tunnel | 0.3–1.3 s |
+| cache hit (no network) | ~0.07 s |
+
 ```
  Spark (spark-001)                      Windows laptop                                  Unreal
 ┌──────────────────────┐  HTTP / NPZ  ┌────────────────────────────────────────────┐  UDP 9001  ┌────────┐
@@ -31,10 +41,10 @@ The CLI is `procedural_animation/procedural_conductor.py`.
 
 ## 1. On the Spark: install once, start by hand
 
-The Spark already has a clone of this repo at `~/project_kaspar/modules/kai-avatar-animation`
-(at `6d5ca17`, 2026-08-04, clean). After this folder is pushed, `git pull` there brings
-it in. Nothing needs installing: the old OSC service's venv already has Kimodo, CUDA
-torch and FastAPI (see `requirements.txt` for a fresh setup).
+The Spark (hostname `kaspar`, Tailscale `100.83.6.8`) has a clone of this repo at
+`~/project_kaspar/modules/kai-avatar-animation`; `git pull` there brings in new code.
+Nothing needs installing: the old OSC service's venv already has Kimodo, CUDA torch
+and FastAPI (see `requirements.txt` for a fresh setup).
 
 ```bash
 cd ~/project_kaspar/modules/kai-avatar-animation/remote_kimodo_service
@@ -56,8 +66,8 @@ SSH login you already have, and makes the Spark's port 8765 appear on the laptop
 ssh -N -L 8765:127.0.0.1:8765 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 etlam@100.83.6.8
 ```
 
-It prints nothing while it works (`-N` = forward only, no shell). If it drops, run it
-again. Check the whole chain:
+After the password it prints nothing: that is the working state (`-N` = forward only,
+no shell). Leave the window open; if it drops, run it again. Check the whole chain:
 
 ```powershell
 curl.exe -s http://127.0.0.1:8765/health
@@ -120,4 +130,10 @@ In every case the player keeps playing what it has, and cached clips stay availa
 
 Tests 5b–7 cover this folder without a Spark: the loop player, client resilience
 against stub servers (refused, accept-and-close, timeout, HTTP 500, malformed NPZ,
-cache hit without network) and the NPZ contract.
+cache hit without network) and the NPZ contract, including a real Kimodo clip from
+the Spark (`procedural_animation/tests/fixtures/kimodo_real_turn_around_2s.npz`).
+`fake_kimodo_server.py` can also stand in for the Spark for offline REPL work:
+
+```powershell
+.\mirroring\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3
+```

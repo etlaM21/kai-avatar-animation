@@ -6,13 +6,19 @@ Real-time markerless mocap and generated motion, both driving the UE5 Mannequin
 Two motion lanes, one seam:
 
 - **Live lane (done):** webcam → MediaPipe → `pose_solver` → OSC 9001 / UDP 11111.
-- **Procedural lane (in progress):** NVIDIA Kimodo on the DGX Spark → NPZ clip →
-  retarget on Windows → the same OSC 9001 / UDP 11111 encoders.
+- **Procedural lane (Phase 1 working, 2026-10-07):** a prompt typed on Windows → NVIDIA
+  Kimodo on the DGX Spark → NPZ clip → cache + retarget on Windows → the same OSC 9001 /
+  UDP 11111 encoders → Manny → MetaHuman. Verified driving the MetaHuman (`55a284d`).
 
-`README.md` describes the live lane as built. `procedural-animation.md` is the
-research and plan for generated motion. `remote-kimodo-streaming.md` is the
-network analysis for reaching the Spark. This file is the working guide: how to
-run things, what is load-bearing, what must not be re-broken, what is open.
+The documents, and what each one is for:
+
+| File | What |
+|---|---|
+| `mirroring\README.md` | How both lanes work, in full detail (§2–8 live lane, §9 generated-motion lane) |
+| `mirroring\procedural-animation.md` | Research and plan for generated motion (Kimodo vs ARDY, retarget math, phases) |
+| `procedural_animation\remote-kimodo-streaming.md` | Network analysis for reaching the Spark |
+| `remote_kimodo_service\README.md` | Operator's guide: start the service, the tunnel, play |
+| this file | The working guide: how to run things, what is load-bearing, what must not be re-broken, what is open |
 
 ## Working agreement
 
@@ -91,12 +97,12 @@ The legacy `mp.solutions` namespace and `mediapipe.framework.formats.landmark_pb
 ### Procedural lane
 
 ```
- Spark (spark-001, user etlam)               Windows laptop                                Unreal
+ Spark (kaspar / spark-001, user etlam)      Windows laptop                                Unreal
 ┌──────────────────────────┐  HTTP / NPZ   ┌───────────────────────────────────────┐  localhost ┌────────┐
-│ kimodo service (FastAPI) │ ◄───────────► │ CLI → kimodo client → clip cache      │  UDP 9001  │ Manny  │
-│  warm model, Lock,       │  via SSH -L   │      → Retargeter (tested, Phase 0)   │  ────────► │  → MH  │
-│  /generate  /health      │  tunnel       │      → motion player (60 Hz clock)    │  UDP 11111 │        │
-│  bound to 127.0.0.1      │               │      → existing OSC + face encoders   │  ────────► │        │
+│ kimodo_service.py        │ ◄───────────► │ procedural_conductor (REPL / one-shot)│  UDP 9001  │ Manny  │
+│  warm model, Lock,       │  via SSH -L   │  → kimodo_client → clip_cache (disk)  │  ────────► │  → MH  │
+│  /generate  /health      │  tunnel       │  → kimodo_adapter → Retargeter        │  UDP 11111 │        │
+│  bound to 127.0.0.1:8765 │               │  → player (60 Hz) → existing encoders │  ────────► │        │
 └──────────────────────────┘               └───────────────────────────────────────┘            └────────┘
 ```
 
@@ -108,11 +114,12 @@ Manny AnimBP, IK Retargeter, `ABP_Face`) is reused untouched.
 
 - Phase 0 done: BVH reader, source-skeleton tables, retarget and player; saved BVH
   clips play into Unreal through the existing pipeline.
-- Phase 1 built and tested offline (2026-10-07): `remote_kimodo_service/` holds the
-  Spark service, its `requirements.txt`, the NPZ contract, the client, the disk cache
-  and the loop player; `procedural_animation/procedural_conductor.py` is the CLI
-  (`procedural_conductor_bvh.py` is the frozen Phase 0 copy, BVH only). Generating on
-  the real Spark since 2026-10-07; not yet judged in Unreal.
+- Phase 1 working end to end (2026-10-07, `55a284d` "1st working remote kimodo
+  connection drives MetaHuman"): `remote_kimodo_service/` holds the Spark service, its
+  `requirements.txt`, the NPZ contract, the adapter, the client, the disk cache and the
+  loop player; `procedural_animation/procedural_conductor.py` is the CLI
+  (`procedural_conductor_bvh.py` is the frozen Phase 0 copy, BVH only, do not extend).
+  Deliberately plain playback for now (see Procedural CLI); chaining deferred.
 - ARDY streaming, the mixer with the webcam lane, and ARDY-SOMA are later
   (`procedural-animation.md` §6).
 
@@ -139,13 +146,14 @@ attempts (`procedural-animation.md` §3) or from the network measurements.
    names, and prompt/seed metadata. All Manny knowledge stays on Windows, next to
    the tests that cover it.
 6. **The network never sits on the real-time path.** The 60 Hz player never waits on
-   a request. While a request is in flight, the current clip finishes, then the idle
-   loop (or a cached clip) plays. Never a frozen pose. Unreal only ever receives
-   packets from `127.0.0.1`.
+   a request, the disk or a retarget: clips reach it already retargeted, through a
+   queue. While a request is in flight, the current clip keeps looping (v1; later the
+   idle loop). Never a frozen pose. Unreal only ever receives packets from `127.0.0.1`.
 7. **Windows always initiates connections.** No inbound firewall rules, works from
    any network.
-8. **Cache every returned clip on disk**, keyed by prompt + seed + frame count (+
-   model name). If the Spark is unreachable, the cache is the library.
+8. **Cache every returned clip on disk**, keyed by prompt + seed + frame count +
+   steps + model name (+ contract version). Only clips that passed validation are
+   cached. If the Spark is unreachable, the cache is the library.
 9. **Packet invariants:** the pose packet is always 421 floats; `present=1.0` while
    playing. The head for the MetaHuman goes through `head_rotation_to_curves()`
    unchanged, with `head_rotation = G_manny[head] · rest_global[head]⁻¹`.
@@ -179,7 +187,7 @@ attempts (`procedural-animation.md` §3) or from the network measurements.
 | Service port | `8765` (setting, not hard-coded); free as of 2026-10-07 |
 | Python env | `~/project_kaspar/modules/kai-avatar-animation/pipeline-network-osc/venv` (Python 3.12.3): kimodo 1.0.0, torch 2.13.0 (CUDA 13 build), fastapi, uvicorn, pydantic, numpy. The new service runs with this interpreter; nothing to install. (`~/ardy/ardy` is the ARDY venv, torch cu132; `~/ComfyUI/venv` unrelated) |
 | Kimodo checkout | `~/kimodo-src` at `1aece8c` (2026-07-13), **locally patched** for aarch64 (MotionCorrection: `sse2neon.h`, `SIMD.h`, `CMakeLists.txt`); installed with `pip install --no-build-isolation ~/kimodo-src`. The plain git URL does not build here |
-| Repo on the Spark | `~/project_kaspar/modules/kai-avatar-animation`, old (`6d5ca17`, 2026-08-04), clean. New code arrives by `git pull` |
+| Repo on the Spark | `~/project_kaspar/modules/kai-avatar-animation`. New code arrives by `git pull` (Malte). Start the service: `cd remote_kimodo_service && ../pipeline-network-osc/venv/bin/python kimodo_service.py` |
 | HF cache | `/opt/huggingface_cache` (also set system-wide in `/etc/profile.d/hf_cache.sh`); has `Kimodo-SOMA-RP-v1.1`, the LLM2Vec / Llama-3-8B text encoder, `ARDY-Core-RP-20FPS-Horizon40` |
 | Kimodo API facts (read from the installed source) | `model.fps` exists (30). `global_rot_mats` and `posed_joints` come from one `somaskel77.fk` over the **standard T-pose** convention (`save_motion_bvh` converts to native only when `standard_tpose=False`), so the FK self-check holds by construction. `root_positions` = `posed_joints[:, root_idx]` (Hips). `foot_contacts` is bool (T, **6**) - measured on real output; the docs say 4. Post-processing replaces the locals before the 77-joint FK, so it stays consistent |
 
@@ -191,7 +199,8 @@ ssh -N -L 8765:127.0.0.1:8765 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
 
 The Windows client talks to `http://127.0.0.1:8765`; the Spark service stays bound to
 `127.0.0.1`. The base URL is a setting. If the direct check below passes, switching
-to `http://100.83.6.8:8765` needs no code change.
+to `http://100.83.6.8:8765` needs no code change. In use since 2026-10-07; after the
+password it prints nothing (`-N`), which is the working state.
 
 **Service lifetime: tied to the login session, on purpose.** Malte starts the service
 by hand in his SSH session; it must end when he logs out. Do **not** use `tmux`,
@@ -211,16 +220,19 @@ tailscale netcheck
 curl.exe -s -o NUL -w "%{http_code} %{time_total}s\n" http://100.83.6.8:8765/
 ```
 
-Re-run `netcheck` after the Spark moves to the colleague's home. If it still shows
-DERP, forwarding UDP 41641 on that router usually enables a direct connection.
+Re-run `netcheck` whenever the Spark or the laptop changes network. If `tailscale
+ping` shows DERP again, forwarding UDP 41641 on the Spark's router usually restores a
+direct connection. The direct-port check has not been run; the tunnel makes it
+unnecessary.
 
 ## Kimodo service (runs on the Spark)
 
 Built as `remote_kimodo_service/kimodo_service.py`, rewritten from
 `pipeline-network-osc/kimodo_service_handoff_osc_v3.py`. **Never edit the old Kimodo
 services** (`pipeline-network-osc/`, `pipeline-network-editor/`, `kimodo/`); new Kimodo
-work goes into `remote_kimodo_service/`. Its `requirements.txt` is what Malte installs
-on the Spark; keep it complete. The design rules it follows:
+work goes into `remote_kimodo_service/`. Its `requirements.txt` documents the Spark
+environment (nothing to install on `kaspar`; a fresh setup needs the patched
+`~/kimodo-src`); keep it complete. The design rules it follows:
 
 - **Keep:** FastAPI, model loaded once and kept warm, `asyncio.Lock` (a request is
   never interrupted mid-generation), shared HF cache, timing log.
@@ -239,15 +251,19 @@ on the Spark; keep it complete. The design rules it follows:
 
 ## Procedural CLI (Windows)
 
-Extend the existing procedural script rather than adding a parallel entry point.
-Target behaviour:
+`procedural_animation/procedural_conductor.py` is the one entry point (don't add a
+parallel one). As built:
 
-- `--prompt "..." [--seconds N] [--seed N]`: one-shot. Generate, cache, retarget,
-  play into Unreal, exit.
-- No `--prompt`: small REPL. Type a prompt, it generates in a **background thread**
-  and queues the clip while input stays responsive. `/list` shows cached clips,
-  `/quit` exits. Both run in the same loop.
-- `--bvh <file>` and cached clips keep working fully offline.
+- `--prompt "..." [--seconds N] [--steps N] [--seed N|random]`: one-shot. Generate (or
+  take from the cache), retarget, play once into Unreal, exit (`--loop` keeps looping).
+  Exit code 3 if the Spark is unreachable and the clip is not cached, 2 on other errors.
+- No source flag: REPL. A typed prompt goes to a single **background generation
+  thread** (one request in flight at a time, FIFO) while input stays responsive.
+  Commands: `/list`, `/play N`, `/next`, `/status`, `/health`, `/help`, `/quit`.
+- `--bvh <file>` (either Kimodo BVH convention) and `--clip <cached.npz>` work fully
+  offline.
+- Threads: main = REPL input; `generation` = cache → HTTP → validate → retarget → cache
+  write → player queue; `LoopPlayer` = the 60 Hz send loop, nothing else.
 - **Playback v1 (Malte, 2026-10-07): plain.** Clips play exactly as retargeted. The
   current clip loops; a queued clip takes over when the current pass ends (hard cut;
   `/next` cuts at once). **No re-centring, heading alignment, crossfade, stage box or
@@ -461,7 +477,12 @@ continuity and stage box wait for those features (deferred, see Procedural CLI).
    and fall back to the cache with a clear message. A cache hit never touches the
    network.
 7. **NPZ contract** — a fixture NPZ with the documented keys, shapes and units (metres,
-   `fps`, `bone_order_names`) loads through the client into the retargeter.
+   `fps`, `bone_order_names`) loads through the client into the retargeter. Covered
+   twice: BVH-derived NPZs must retarget identically to the BVH path, and the REAL
+   Kimodo clip `tests\fixtures\kimodo_real_turn_around_2s.npz` must pass the FK
+   self-check and the bone-direction truth (float32 tolerance 0.01°, measured 0.0003°).
+
+Current state: 55 checks, all pass, over all 243 BVH clips plus the real fixture.
 
 Then the Unreal check, stage by stage like `tests/ue_head_probe.py`: stream a handful
 of known poses and read the MetaHuman bones back.
@@ -523,14 +544,13 @@ touch only `gui.py`.
 
 ### Next up
 
-- **Kimodo on-demand lane (Phase 1): first look in Unreal.** Generation through the
-  tunnel works (2026-10-07). Real output: standard convention, FK self-check 0.00003 cm,
-  `root_positions` = Hips exactly, 40 Manny bones within 0.0006° of Kimodo's own joints;
-  a real clip is the fixture `procedural_animation\tests\fixtures\kimodo_real_turn_around_2s.npz`.
+- **Kimodo on-demand lane (Phase 1): working, now tune by eye.** Drives the MetaHuman
+  end to end (2026-10-07). Real output: standard convention, FK self-check 0.00003 cm,
+  `root_positions` = Hips exactly, 40 Manny bones within 0.0006° of Kimodo's own joints.
   Measured on the GB10, 270 frames (9 s): 100 steps 5.8 s warm (7.3 s first request),
   50 steps 2.9 s, 25 steps 1.5 s, 10 steps 0.7 s; transfer of the ~890 KB NPZ 0.3-1.3 s
-  (direct link, through the SSH tunnel); `/health` round trip 76 ms. Next: play into
-  Unreal (REPL), judge quality vs steps by eye.
+  (direct link, through the SSH tunnel); `/health` round trip 76 ms. Next: judge
+  quality vs steps in Unreal and pick the default; then the deferred playback layers.
 - **Head yaw beyond 75° on the face channel (open problem, procedural lane).** The Live
   Link Face head curves are ABSOLUTE component-space rotation, measured in Unreal as
   linear only up to 75°. Generated motion turns the whole body: measured over 243
@@ -559,8 +579,8 @@ touch only `gui.py`.
 - **Record an occlusion clip** if you want the gating thresholds tuned harder: lean
   over the desk until the legs leave frame, step half out of shot, put one arm behind
   your back.
-- **Run the 5-minute Spark network check** (Spark access section) and note whether
-  non-SSH ports work, so we know whether the tunnel is needed.
+- **Optional: the direct-port check** (Spark access section). The tunnel works, so this
+  only matters if you want to drop it.
 - **Request Llama-3-8B-Instruct access on Hugging Face** before the ARDY phase.
 
 ### Not started

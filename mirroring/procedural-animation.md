@@ -5,6 +5,26 @@ Research notes, comparison and integration plan. Written 2026-09-28 against
 (arXiv 2607.08741), the Hugging Face model cards, and this repo's earlier Kimodo
 attempts (`kimodo/`, `pipeline-network-editor/`, `pipeline-network-osc/`).
 
+> **Status, 2026-10-07: Phases 0 and 1 are built and working.** Saved BVH clips and
+> prompts generated on demand on the DGX Spark both drive the MetaHuman through the
+> unchanged encoders, plugin and Unreal setup. How it works as built: `README.md` §9.
+> What is load-bearing and what is open: `../CLAUDE.md`. This document stays the
+> research and plan; where the build departs from it:
+>
+> | Plan | As built |
+> |---|---|
+> | `procedural/` package, `services/` folder (§4, §4.5) | `procedural_animation/` (BVH reader, tables, retarget, CLI, tests) and `remote_kimodo_service/` (Spark service, NPZ contract, adapter, client, cache, player), both at the module root |
+> | `Spine2 → spine_03`, `Neck2 → neck_02` (§4.1) | `spine_03`, `spine_05`, `neck_02` get no source joint and stay at bind relative to their parent, exactly as Unreal treats unstreamed bones; `Spine2 → spine_02`, `Chest → spine_04` |
+> | Swing alignment for every bone (§4.1) | Same, except the **head**: identity map of rest frames, because the swing tilted every head up 6.5° (SOMA's `Head → HeadEnd` leans back) |
+> | NPZ: rotations, root, contacts, fps, names, metadata (§4.3) | Plus `posed_joints`, so the client proves by FK that the rotations mean what the retarget assumes; a clip that fails is refused and never cached |
+> | Player: crossfade, chaining constraint, idle loop (§4.2, Phase 1) | v1 is deliberately plain: the current clip loops, the next one hard-cuts in at the end of the pass, no re-centring. Crossfade, heading alignment, idle loop and chaining (`first_frame`, reserved in the request schema) come next |
+> | Kimodo on WSL2 / a local 4090 (§6) | On the DGX Spark (`kaspar`, GB10): 5.8 s for 9 s at 100 steps, 1.5 s at 25 steps, reached through an SSH tunnel |
+> | `kimodo_service_handoff_osc_v3.py` as the base (§4.3) | Rewritten in `remote_kimodo_service/kimodo_service.py`; the old services are left untouched |
+>
+> New open problem found while building: the face channel's head yaw is absolute and
+> was only measured linear to 75° in Unreal, while generated clips turn up to ±180°
+> (`README.md` §10).
+
 **Short answer.**
 - **Kimodo:** usable today. It generates whole clips (≤ 10 s each) on the SOMA
   skeleton in about 3 s on a 4090.
@@ -126,7 +146,7 @@ plane). There are no finger chains.
 | Fit for K.ai | a **gesture/motion library**: pre-generate or generate on demand, play back, crossfade | a **live, steerable** performer (LLM or operator changes prompts in real time) | the best of both |
 
 Neither model animates the face or fingers. Both give a full body with root
-motion, which is exactly the part the webcam lane cannot give (README §9, "Root
+motion, which is exactly the part the webcam lane cannot give (README §10, "Root
 translation").
 
 **Recommendation.** Build the Manny retarget layer and the player **once**,
@@ -375,7 +395,7 @@ it: stream a handful of known poses and read the MetaHuman bones back.
 
 ## 6. Plan
 
-**Phase 0 — offline retarget on existing clips (Windows only, ~no risk)**
+**Phase 0 — offline retarget on existing clips (Windows only, ~no risk)** — *done*
 1. `bvh_reader.py` + `source_skeletons.py` (SOMA77 from the BVH hierarchy, which
    is the same layout Kimodo exports).
 2. `retarget.py` per §4.1; tests 1–3 green on `kimodo-gen/*.bvh`.
@@ -383,10 +403,12 @@ it: stream a handful of known poses and read the MetaHuman bones back.
    existing encoders. **This is the first moment it is visible in the engine,
    and it needs no Kimodo install at all.**
 
-**Phase 1 — Kimodo live-on-demand**
+**Phase 1 — Kimodo live-on-demand** — *working (2026-10-07); crossfade, chaining and
+idle loop deferred*
 4. Slim `kimodo_service.py` (returns NPZ, no OSC). Player queue, crossfade,
    chaining constraint, idle loop.
-5. Head curves to the face channel; decide the blendshape default.
+5. Head curves to the face channel; decide the blendshape default. (Done: head
+   through `head_rotation_to_curves()`, blendshapes neutral.)
 
 **Phase 2 — ARDY-Core streaming**
 6. Get HF access to Llama-3-8B-Instruct; install ARDY in WSL2 (CMake build);
