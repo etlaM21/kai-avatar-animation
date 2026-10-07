@@ -111,8 +111,8 @@ Manny AnimBP, IK Retargeter, `ABP_Face`) is reused untouched.
 - Phase 1 built and tested offline (2026-10-07): `remote_kimodo_service/` holds the
   Spark service, its `requirements.txt`, the NPZ contract, the client, the disk cache
   and the loop player; `procedural_animation/procedural_conductor.py` is the CLI
-  (`procedural_conductor_bvh.py` is the frozen Phase 0 copy, BVH only). Not yet run
-  against the real Kimodo on the Spark.
+  (`procedural_conductor_bvh.py` is the frozen Phase 0 copy, BVH only). Generating on
+  the real Spark since 2026-10-07; not yet judged in Unreal.
 - ARDY streaming, the mixer with the webcam lane, and ARDY-SOMA are later
   (`procedural-animation.md` §6).
 
@@ -181,7 +181,7 @@ attempts (`procedural-animation.md` §3) or from the network measurements.
 | Kimodo checkout | `~/kimodo-src` at `1aece8c` (2026-07-13), **locally patched** for aarch64 (MotionCorrection: `sse2neon.h`, `SIMD.h`, `CMakeLists.txt`); installed with `pip install --no-build-isolation ~/kimodo-src`. The plain git URL does not build here |
 | Repo on the Spark | `~/project_kaspar/modules/kai-avatar-animation`, old (`6d5ca17`, 2026-08-04), clean. New code arrives by `git pull` |
 | HF cache | `/opt/huggingface_cache` (also set system-wide in `/etc/profile.d/hf_cache.sh`); has `Kimodo-SOMA-RP-v1.1`, the LLM2Vec / Llama-3-8B text encoder, `ARDY-Core-RP-20FPS-Horizon40` |
-| Kimodo API facts (read from the installed source) | `model.fps` exists (30). `global_rot_mats` and `posed_joints` come from one `somaskel77.fk` over the **standard T-pose** convention (`save_motion_bvh` converts to native only when `standard_tpose=False`), so the FK self-check holds by construction. `root_positions` = `posed_joints[:, root_idx]` (Hips). `foot_contacts` is bool (T, 4). Post-processing replaces the locals before the 77-joint FK, so it stays consistent |
+| Kimodo API facts (read from the installed source) | `model.fps` exists (30). `global_rot_mats` and `posed_joints` come from one `somaskel77.fk` over the **standard T-pose** convention (`save_motion_bvh` converts to native only when `standard_tpose=False`), so the FK self-check holds by construction. `root_positions` = `posed_joints[:, root_idx]` (Hips). `foot_contacts` is bool (T, **6**) - measured on real output; the docs say 4. Post-processing replaces the locals before the 77-joint FK, so it stays consistent |
 
 **Default transport: SSH port forward.**
 
@@ -523,12 +523,14 @@ touch only `gui.py`.
 
 ### Next up
 
-- **Kimodo on-demand lane (Phase 1): first run on the real Spark.** Built and green
-  offline; Spark inspected (see Spark access). Next: commit + push, `git pull` on the
-  Spark, Malte starts the service with the `pipeline-network-osc/venv` interpreter, one
-  real generation. Confirm the FK self-check passes on real output (expected by
-  construction from Kimodo's source, so far measured on BVH-derived NPZs only), commit
-  that first real NPZ as a test fixture, record generation vs transfer times here.
+- **Kimodo on-demand lane (Phase 1): first look in Unreal.** Generation through the
+  tunnel works (2026-10-07). Real output: standard convention, FK self-check 0.00003 cm,
+  `root_positions` = Hips exactly, 40 Manny bones within 0.0006° of Kimodo's own joints;
+  a real clip is the fixture `procedural_animation\tests\fixtures\kimodo_real_turn_around_2s.npz`.
+  Measured on the GB10, 270 frames (9 s): 100 steps 5.8 s warm (7.3 s first request),
+  50 steps 2.9 s, 25 steps 1.5 s, 10 steps 0.7 s; transfer of the ~890 KB NPZ 0.3-1.3 s
+  (direct link, through the SSH tunnel); `/health` round trip 76 ms. Next: play into
+  Unreal (REPL), judge quality vs steps by eye.
 - **Head yaw beyond 75° on the face channel (open problem, procedural lane).** The Live
   Link Face head curves are ABSOLUTE component-space rotation, measured in Unreal as
   linear only up to 75°. Generated motion turns the whole body: measured over 243

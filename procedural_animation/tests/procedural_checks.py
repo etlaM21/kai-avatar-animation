@@ -125,6 +125,9 @@ GEOMETRY_SEGMENTS = [("neck_01", "head"), ("hand_l", "middle_01_l"), ("hand_r", 
     (p, n) for n, p, _r, _o in FINGER_CHAIN if p in ("hand_l", "hand_r")]
 
 TOL_DIR_DEG = 1e-3
+# The NPZ travels as float32; a real Kimodo clip measured 0.00057 deg worst.
+TOL_DIR_DEG_FLOAT32 = 0.01
+REAL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "kimodo_real_turn_around_2s.npz"
 # Head curves travel as float32 (1 unit = 50 deg), so a correct round trip lands
 # within ~1e-5 deg; a wrong sign, axis or composition order misses by degrees.
 TOL_HEAD_CHANNEL_DEG = 0.01
@@ -636,6 +639,20 @@ def check_contract(rt: Retargeter, paths: list[Path], rep: Report) -> None:
         rep.check(adapted.convention == conv and dq < 1e-3 and dp < 1e-3,
                   f"{p.name} ({conv}) via NPZ == via BVH: {dq:.5f} deg, pelvis {dp:.5f} cm "
                   f"(FK self-check {adapted.fk_error_cm:.4f} cm)")
+
+    # Real Kimodo output from the Spark (kimodo 1.0.0, 2026-10-07): the convention, the
+    # root and the units are Kimodo's own, not the ones clip_from_bvh writes.
+    real = contract.unpack(REAL_FIXTURE.read_bytes())
+    motion, adapted = retarget_npz(real, rt)
+    src = {n: real.posed_joints[:, i] * 100.0 @ TO_COMP.T for i, n in enumerate(real.bone_order_names)}
+    err = compare(manny_fk(motion), src, motion)
+    worst = max(float(np.nanmax(err[f"{a}->{b}"])) for a, b in LIMB_SEGMENTS + FINGER_SEGMENTS)
+    rep.check(adapted.convention == "standard" and adapted.fk_error_cm < 1e-3 and adapted.root_vs_hips_cm < 1e-3,
+              f"real Kimodo NPZ ({REAL_FIXTURE.name}): {adapted.convention} convention, FK self-check "
+              f"{adapted.fk_error_cm:.5f} cm, root_positions = Hips to {adapted.root_vs_hips_cm:.5f} cm")
+    # float32 off the wire: ~6e-4 deg measured, against 1e-5 for float64 BVH data.
+    rep.check(worst < TOL_DIR_DEG_FLOAT32,
+              f"real Kimodo NPZ: 40 Manny bones vs Kimodo's own posed_joints, worst {worst:.5f} deg")
 
     with np.load(io.BytesIO(data), allow_pickle=False) as z:
         keys = {k: (z[k].shape, z[k].dtype.kind) for k in z.files}

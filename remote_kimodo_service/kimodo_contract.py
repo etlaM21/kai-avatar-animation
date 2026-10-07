@@ -15,7 +15,8 @@ invariant 5). One clip, T frames, Kimodo's 77 somaskel77 joints in Kimodo's own
     posed_joints      (T, 77, 3)    float32  metres; global joint positions. Lets the
                                              client check, by FK, that the rotations mean
                                              what it assumes (convention, transpose, root)
-    foot_contacts     (T, N)        float32  as Kimodo returns them
+    foot_contacts     (T, N)        float32  as Kimodo returns them (bool -> 0/1; N = 6 from
+                                             kimodo 1.0.0, not the 4 its docs state)
     fps               ()            float32
     bone_order_names  (77,)         unicode
     meta_json         ()            unicode  prompt, seed, num_frames, steps, model, timings
