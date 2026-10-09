@@ -9,7 +9,7 @@
     .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --clip cached.npz [--loop]
         offline: an existing Kimodo BVH (either convention) or a cached NPZ.
 
-Inline prompt options, anywhere in the prompt: `/s N` denoising steps (default 100),
+Inline prompt options, anywhere in the prompt: `/s N` denoising steps (default 33),
 `/seed N` or `/seed random`, `/t N` seconds (max 10). Seeds default to a fixed value, so
 the same prompt is a cache hit; `/seed random` or `--seed random` gives variety.
 
@@ -36,6 +36,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import MIRRORING_DIR  # noqa: F401  (puts mirroring on sys.path)
@@ -47,7 +48,7 @@ from remote_kimodo_service import kimodo_contract as contract
 from remote_kimodo_service.clip_cache import DEFAULT_CACHE_DIR, ClipCache
 from remote_kimodo_service.kimodo_adapter import retarget as retarget_npz
 from remote_kimodo_service.kimodo_client import (
-    DEFAULT_TIMEOUT_S, DEFAULT_URL, GenerationFailed, KimodoClient, SparkUnavailable,
+    DEFAULT_TIMEOUT_S, DEFAULT_URL, GenerationFailed, GenerationResult, KimodoClient, SparkUnavailable,
 )
 from remote_kimodo_service.kimodo_contract import ContractError, GenerationRequest
 from remote_kimodo_service.player import LIVE_LINK_FACE_PORT, POSE_OSC_PORT, LoopPlayer, Sender
@@ -92,6 +93,23 @@ def parse_prompt(line: str, seconds: float, steps: int, seed: int | str,
     return GenerationRequest.build(text, seed=seed, seconds=seconds, steps=steps, model=model)
 
 
+@dataclass
+class Fetched:
+    """Everything Lane.fetch_detailed() learned about one clip, for callers that show it
+    (gui.py's Prompt tab shows the generation time of every clip, cached ones included).
+
+    meta is the NPZ's own meta_json. The Spark writes `generation_s` (GPU time) and
+    `created` into it, so a clip from the disk cache still knows how long it took when it
+    was generated. result is None for a disk-cache hit: there was no request, so there is
+    no total / queue / transfer time to report."""
+    motion: RetargetedMotion
+    label: str
+    meta: dict
+    result: GenerationResult | None   # None = answered from the disk cache
+    convention: str                   # "standard" or "native" (kimodo_adapter)
+    path: Path | None                 # the cache file written; None for a cache hit
+
+
 class Lane:
     """Request -> cache or Spark -> validated clip -> retarget. Every failure comes back
     as a one-line message; nothing here ever touches the player thread's timing."""
@@ -102,31 +120,48 @@ class Lane:
         self.retargeter = retargeter
 
     def motion_from_npz(self, data: bytes) -> tuple[RetargetedMotion, str]:
+        motion, conv, _meta = self._motion_conv_meta(data)
+        return motion, conv
+
+    def _motion_conv_meta(self, data: bytes) -> tuple[RetargetedMotion, str, dict]:
         clip = contract.unpack(data)
         motion, adapted = retarget_npz(clip, self.retargeter)
-        return motion, adapted.convention
+        return motion, adapted.convention, clip.meta
 
-    def fetch(self, req: GenerationRequest) -> tuple[RetargetedMotion, str]:
-        """(motion, label). Raises SparkUnavailable / GenerationFailed / ContractError."""
+    def fetch_detailed(self, req: GenerationRequest) -> Fetched:
+        """fetch() with everything it learns along the way, instead of only printing it.
+
+        Added for the GUI (2026-10-09) as a hook, not a second code path: fetch() is now a
+        thin wrapper around this, so the order that matters - validate (retarget) BEFORE
+        caching, CLAUDE.md procedural invariant 8 - exists exactly once. The CLI's output
+        is unchanged; the "generated ..." line it printed is printed by fetch().
+        Raises SparkUnavailable / GenerationFailed / ContractError."""
         data = self.cache.get(req)
         if data is not None:
             try:
-                motion, _conv = self.motion_from_npz(data)
-                return motion, f"{req.prompt!r} seed {req.seed} (cache)"
+                motion, conv, meta = self._motion_conv_meta(data)
+                return Fetched(motion, f"{req.prompt!r} seed {req.seed} (cache)", meta, None, conv, None)
             except ContractError as e:
                 print(f"  cached file for {req.prompt!r} is unusable ({e}); asking the Spark again")
         result = self.client.generate(req)
         # Validate BEFORE caching: a clip the retarget refuses must not become library.
-        motion, conv = self.motion_from_npz(result.data)
+        motion, conv, meta = self._motion_conv_meta(result.data)
         path = self.cache.put(req, result.data)
-        timing = f"{result.total_s:.1f} s total"
-        if result.generation_s is not None:
-            timing += (f" = {result.generation_s:.1f} s generating + {result.queue_s or 0:.1f} s queued"
-                       f" + {result.transfer_s:.1f} s transfer")
-        print(f"  generated {req.prompt!r} seed {req.seed}, {req.steps} steps: {timing}, "
-              f"{len(result.data) / 1e3:.0f} KB{' (server cache)' if result.server_cache else ''}"
-              f"{'' if conv == 'standard' else f', {conv} convention'} -> {path.name}")
-        return motion, f"{req.prompt!r} seed {req.seed}"
+        return Fetched(motion, f"{req.prompt!r} seed {req.seed}", meta, result, conv, path)
+
+    def fetch(self, req: GenerationRequest) -> tuple[RetargetedMotion, str]:
+        """(motion, label). Raises SparkUnavailable / GenerationFailed / ContractError."""
+        f = self.fetch_detailed(req)
+        result = f.result
+        if result is not None:
+            timing = f"{result.total_s:.1f} s total"
+            if result.generation_s is not None:
+                timing += (f" = {result.generation_s:.1f} s generating + {result.queue_s or 0:.1f} s queued"
+                           f" + {result.transfer_s:.1f} s transfer")
+            print(f"  generated {req.prompt!r} seed {req.seed}, {req.steps} steps: {timing}, "
+                  f"{len(result.data) / 1e3:.0f} KB{' (server cache)' if result.server_cache else ''}"
+                  f"{'' if f.convention == 'standard' else f', {f.convention} convention'} -> {f.path.name}")
+        return f.motion, f.label
 
 
 def load_bvh_motion(path: Path, retargeter: Retargeter) -> RetargetedMotion:

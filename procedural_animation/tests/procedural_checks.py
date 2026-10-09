@@ -530,6 +530,19 @@ def check_player(rt: Retargeter, rep: Report) -> None:
     player.stop()
     rep.check(done, "loop=False: plays the clip once, then reports finished")
 
+    # clear_pending(): the GUI's hook for Remove / Clear / reorder.
+    sender, log = _capturing_sender()
+    player = LoopPlayer(sender, loop=True)
+    for label in "ABC":
+        player.enqueue(a, label)
+    player.start()
+    time.sleep(0.1)
+    drained = [c.label for c in player.clear_pending()]
+    time.sleep(a.duration_s + 0.1)
+    rep.check(drained == ["B", "C"] and player.current.label == "A" and player.passes >= 1 and not player.queued,
+              f"clear_pending() takes the queued clips back in order ({drained}); the current one keeps looping")
+    player.stop()
+
 
 # ---------------------------------------------------------------------------
 # 6. Client resilience (no Spark: stub servers and a closed port)
@@ -598,6 +611,21 @@ def check_client(rt: Retargeter, rep: Report) -> None:
         kind, msg, _ = outcome(lambda: refused.fetch(req))
         rep.check(kind == "ok", f"cache hit with the Spark unreachable -> {kind} (network not touched)")
         rep.check(n_live == 2, f"the stub saw exactly one generate + one health ({n_live} requests)")
+
+        # fetch_detailed(): the GUI's hook. fetch() is a wrapper around it, so the checks
+        # above cover its failure paths; this covers what it reports.
+        req2 = GenerationRequest.build("A person jumps", seed=3, seconds=1.0)
+        with FakeKimodo(mode="ok") as fake:
+            lane = Lane(KimodoClient(fake.url), cache, rt)
+            miss = lane.fetch_detailed(req2)
+            hit = lane.fetch_detailed(req2)
+            n_live = fake.requests
+        rep.check(miss.result is not None and miss.result.generation_s is not None and miss.path is not None
+                  and miss.path.exists() and miss.meta.get("prompt") == req2.prompt
+                  and hit.result is None and hit.path is None and hit.meta == miss.meta
+                  and hit.label.endswith("(cache)") and n_live == 1,
+                  "fetch_detailed: a miss reports the request's timings and the cache file; a hit reports "
+                  "the same NPZ meta and makes no request")
 
     cases = {"A person walks /s 25": (25, 0, 270), "A person walks /seed 7 /t 4": (100, 7, 120),
              "walks and/or runs": (100, 0, 270)}

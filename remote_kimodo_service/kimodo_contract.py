@@ -39,7 +39,11 @@ DEFAULT_MODEL = "Kimodo-SOMA-RP-v1.1"
 KIMODO_FPS = 30
 MAX_SECONDS = 10.0           # Kimodo's limit per prompt
 DEFAULT_SECONDS = 9.0
-DEFAULT_STEPS = 100
+# Malte, 2026-10-09: 100 steps is unnecessary, 33 is the default (it is what he had been
+# typing as `/s 33`). Measured on the GB10 for 9 s of motion: 100 steps 5.8 s, 50 steps
+# 2.9 s, 25 steps 1.5 s. Shared with the Spark: its service default follows after a
+# `git pull` there.
+DEFAULT_STEPS = 33
 
 
 class ContractError(ValueError):

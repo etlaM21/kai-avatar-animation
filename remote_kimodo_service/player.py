@@ -94,6 +94,22 @@ class LoopPlayer:
         """Cut to the next queued clip now instead of at the end of the pass."""
         self._skip.set()
 
+    def clear_pending(self) -> list[Clip]:
+        """Take every queued clip back out, in play order; the current clip keeps playing.
+
+        Added for the GUI (2026-10-09): its queue can Remove, Clear and reorder clips that
+        were already handed to this player. Without this, a clip in _pending could only
+        ever play. The GUI drains, edits the list and enqueue()s the rest back in its new
+        order. Draining is thread-safe against the 60 Hz thread: get_nowait() hands each
+        clip to exactly one taker, so a clip is either drained here or started there, never
+        both, and never lost. The CLI does not use it."""
+        out: list[Clip] = []
+        while True:
+            try:
+                out.append(self._pending.get_nowait())
+            except queue.Empty:
+                return out
+
     @property
     def queued(self) -> int:
         return self._pending.qsize()
