@@ -1,0 +1,12 @@
+# Live lane (mirroring/): conductor.py, pose_solver.py, the capture and protocol modules,
+# tests/solver_checks.py. Python >= 3.12.
+# Pinned to the versions every acceptance test passed with on 2026-10-09.
+
+mediapipe==1.0.1
+# cv2. The contrib build, NOT opencv-python: mediapipe 1.0.1 depends on
+# opencv-contrib-python already, and the two install the same cv2 package over each
+# other (the old mirroring\venv had both).
+opencv-contrib-python==5.0.0.93
+numpy==2.5.2
+scipy==1.18.1
+python-osc==1.10.2

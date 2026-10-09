@@ -1,7 +1,7 @@
 """A stand-in for the Spark's kimodo_service.py, stdlib only, for tests and offline work.
 
-    .\\mirroring\\venv\\Scripts\\python.exe -m remote_kimodo_service.fake_kimodo_server
-    .\\mirroring\\venv\\Scripts\\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3
+    .\\venv\\Scripts\\python.exe -m remote_kimodo_service.fake_kimodo_server
+    .\\venv\\Scripts\\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3
 
 Same endpoints and headers as the real service. "Generation" picks one of the existing
 kimodo-gen/*.bvh clips (by prompt hash) and returns it as the NPZ the real service
@@ -30,7 +30,10 @@ from procedural_animation.bvh_reader import BvhClip, read_bvh
 
 from . import kimodo_contract as contract
 
-CLIP_DIRS = [MODULE_ROOT / "kimodo" / "kimodo-gen", MODULE_ROOT / "pipeline-network-editor" / "kimodo-gen"]
+# Order matters: a prompt picks its clip by hash index into the combined list, so
+# reordering changes which clip a given prompt gets.
+CLIP_DIRS = [MODULE_ROOT / "assets" / "kimodo" / "clips" / "kimodo-gen",
+             MODULE_ROOT / "assets" / "kimodo" / "clips" / "editor-gen"]
 
 
 def clip_from_bvh(bvh: BvhClip, meta: dict | None = None) -> contract.KimodoClip:

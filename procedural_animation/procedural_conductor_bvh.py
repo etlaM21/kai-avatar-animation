@@ -9,10 +9,10 @@
 # =====================================================================================
 """Play a Kimodo SOMA77 BVH clip into Unreal through the existing mirroring encoders.
 
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --loop
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --loop --root in-place
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --dry-run
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --loop
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --loop --root in-place
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor_bvh --bvh clip.bvh --dry-run
 
 Sends exactly what conductor.py sends, to the same default ports, so Unreal needs no
 change: 60 BoneTransforms (22 body + 19 + 19 fingers, 421 floats with the present

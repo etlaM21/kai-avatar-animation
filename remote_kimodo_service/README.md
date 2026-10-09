@@ -83,14 +83,14 @@ From the repo root (`kai-avatar-animation`):
 
 ```powershell
 # REPL: type prompts; the current clip loops while the next one generates
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor
 
 # one shot: generate (or take from the cache), play once, exit
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves both arms"
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves both arms"
 
 # offline
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --bvh kimodo\kimodo-gen\wave.bvh --loop
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --clip remote_kimodo_service\cache\<file>.npz --loop
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --bvh assets\kimodo\clips\kimodo-gen\wave.bvh --loop
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --clip remote_kimodo_service\cache\<file>.npz --loop
 ```
 
 Stop `conductor.py` first: both send to the same ports.
@@ -125,7 +125,7 @@ In every case the player keeps playing what it has, and cached clips stay availa
 ## Tests
 
 ```powershell
-.\mirroring\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
+.\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
 ```
 
 Tests 5b–7 cover this folder without a Spark: the loop player, client resilience
@@ -135,5 +135,5 @@ the Spark (`procedural_animation/tests/fixtures/kimodo_real_turn_around_2s.npz`)
 `fake_kimodo_server.py` can also stand in for the Spark for offline REPL work:
 
 ```powershell
-.\mirroring\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3
+.\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3
 ```

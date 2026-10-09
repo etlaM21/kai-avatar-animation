@@ -1,0 +1,13 @@
+# Procedural lane, Windows side: procedural_animation/ and the Windows half of
+# remote_kimodo_service/ (client, cache, adapter, contract, player, fake server),
+# procedural_animation/tests/procedural_checks.py.
+#
+# NO torch, NO GPU stack, ever: generation runs on the Spark (CLAUDE.md). The HTTP
+# client is stdlib urllib. The player sends through the live lane's protocol modules
+# (imported read-only from mirroring/), hence python-osc; its pose_solver import pulls
+# in mediapipe too, so this file is not enough on its own - install requirements.txt.
+# Pinned to the versions every acceptance test passed with on 2026-10-09.
+
+numpy==2.5.2
+scipy==1.18.1
+python-osc==1.10.2

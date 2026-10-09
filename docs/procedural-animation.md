@@ -57,7 +57,7 @@ sequence per call.
 | Frame rate | 30 fps (all saved BVHs here: `Frame Time: 0.0333`) |
 | Length | max **10 s per prompt**. Longer sequences come from `multi_prompt=True` (segments generated one after another and stitched with `num_transition_frames`) or from chaining calls with a full-body keyframe constraint on frame 0. |
 | Control | text, full-body keyframes, 2D root path/waypoints, end-effector position/rotation (hands, feet) — sparse, < 20 keyframes per constraint type |
-| Speed (measured here) | model load 24 s; 270 frames × 100 DDIM steps ≈ **2.5–2.7 s** on an RTX 4090 (`kimodo/kimodo-gen/gen-time.txt`); 3–11 s in the OSC service log (`pipeline-network-osc/pipeline_timing_log.txt`, different machine/steps) |
+| Speed (measured here) | model load 24 s; 270 frames × 100 DDIM steps ≈ **2.5–2.7 s** on an RTX 4090 (`assets/kimodo/clips/kimodo-gen/gen-time.txt`); 3–11 s in the OSC service log (`pipeline-network-osc/pipeline_timing_log.txt`, different machine/steps) |
 | VRAM | ~17 GB (mostly the LLM2Vec / Llama-3-8B text encoder); < 3 GB with `TEXT_ENCODER_DEVICE=cpu` |
 | Platform | developed on Linux; this repo ran it under WSL2 and on the DGX Spark |
 | Licence | code Apache-2.0; SOMA/G1 weights NVIDIA Open Model Agreement (commercial OK) |

@@ -1,5 +1,5 @@
 """Procedural animation lane: generated motion (Kimodo, later ARDY) retargeted onto
-the 60 Manny bones that `mirroring` streams. See mirroring/procedural-animation.md.
+the 60 Manny bones that `mirroring` streams. See docs/procedural-animation.md.
 
 Lives beside `mirroring`, not inside it, but runs on the mirroring venv and imports
 pose_solver and the two protocol modules from there read-only. Nothing in

@@ -1,12 +1,12 @@
 """Play generated motion into Unreal through the existing mirroring encoders.
 
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor
         REPL: type a prompt, it is generated on the Spark in the background while the
         current clip keeps looping; /help lists the commands.
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves /s 25"
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves /s 25"
         one shot: generate (or take from the cache), play once, exit. --loop keeps looping.
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --bvh clip.bvh [--loop]
-    .\\mirroring\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --clip cached.npz [--loop]
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --bvh clip.bvh [--loop]
+    .\\venv\\Scripts\\python.exe -m procedural_animation.procedural_conductor --clip cached.npz [--loop]
         offline: an existing Kimodo BVH (either convention) or a cached NPZ.
 
 Inline prompt options, anywhere in the prompt: `/s N` denoising steps (default 33),

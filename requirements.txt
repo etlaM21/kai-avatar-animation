@@ -1,0 +1,16 @@
+# The Windows venv for this module: live lane, procedural lane and GUI. One venv,
+# at the module root:
+#
+#     py -3.12 -m venv venv
+#     .\venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Split by what needs it (each file says why):
+#     requirements-mirroring.txt    live lane (conductor.py, pose_solver.py, ...)
+#     requirements-procedural.txt   procedural lane, Windows side
+#     requirements-gui.txt          gui.py (both of the above + Pillow)
+#
+# The Spark has its own venv and file: remote_kimodo_service/requirements.txt.
+
+-r requirements-mirroring.txt
+-r requirements-procedural.txt
+-r requirements-gui.txt

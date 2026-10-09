@@ -109,7 +109,7 @@ order or field names.
 ### Running it
 
 ```powershell
-.\venv\Scripts\python.exe conductor.py --debug --camera 1
+..\venv\Scripts\python.exe conductor.py --debug --camera 1
 ```
 
 Needs `holistic_landmarker.task` next to `conductor.py` (download link in
@@ -124,8 +124,8 @@ early sessions, ~7° in the current recordings) - always calibrate.
 ### Recording + offline solver checks
 
 ```powershell
-.\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\rest.npz
-.\venv\Scripts\python.exe tests\solver_checks.py              # runs on every recordings\*.npz
+..\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\rest.npz
+..\venv\Scripts\python.exe tests\solver_checks.py              # runs on every recordings\*.npz
 ```
 
 `--record` dumps the raw (pre-solve, pre-smoothing) landmarks of the session on
@@ -155,7 +155,7 @@ both send to the same ports.
 Or drive the same pipeline from a GUI instead of the terminal:
 
 ```powershell
-.\venv\Scripts\python.exe gui.py
+..\venv\Scripts\python.exe gui.py
 ```
 
 ### GUI control surface (`gui.py`)
@@ -438,7 +438,7 @@ explanation.
 ```
 
 Design rules behind this shape (measured reasons in
-`procedural_animation/remote-kimodo-streaming.md`):
+`docs/remote-kimodo-streaming.md`):
 
 - **Windows asks, the Spark answers.** Every connection starts on the laptop, so no
   firewall rule is needed anywhere and it works from any network.
@@ -483,12 +483,12 @@ working state. `curl.exe -s http://127.0.0.1:8765/health` checks the whole chain
 
 ```powershell
 # REPL
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor
 # one shot: generate (or take from cache), play once, exit
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves both arms /s 25"
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --prompt "A person waves both arms /s 25"
 # offline
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --bvh kimodo\kimodo-gen\wave.bvh --loop
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --clip remote_kimodo_service\cache\<file>.npz --loop
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --bvh assets\kimodo\clips\kimodo-gen\wave.bvh --loop
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --clip remote_kimodo_service\cache\<file>.npz --loop
 ```
 
 | Flag | Default | |
@@ -631,7 +631,7 @@ version. Anything else raises `ContractError`.
 ### 9.8 Stage 6 — the adapter and the self-check (`kimodo_adapter.py`)
 
 The retarget was built and tested against Kimodo's own T-pose **BVH**
-(`kimodo/soma_skeleton/somaskel77_standard_tpose.bvh`, read by
+(`assets/kimodo/soma_skeleton/somaskel77_standard_tpose.bvh`, read by
 `source_skeletons.load_soma77`). The adapter bridges the three differences between
 that skeleton and the NPZ:
 
@@ -781,7 +781,7 @@ positions; the face-channel head decodes to the body's head exactly.
 ### 9.13 Tests
 
 ```powershell
-.\mirroring\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
+.\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
 ```
 
 No GPU, no Spark, no engine; 55 checks, exit code 1 on any failure. As in
@@ -802,7 +802,7 @@ No GPU, no Spark, no engine; 55 checks, exit code 1 on any failure. As in
 `remote_kimodo_service/fake_kimodo_server.py` is a stdlib stand-in for the service
 (clips built from the BVH library, plus failure modes); the tests use it, and it can
 replace the Spark for offline REPL work:
-`.\mirroring\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3`.
+`.\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3`.
 
 ### 9.14 Known limits
 

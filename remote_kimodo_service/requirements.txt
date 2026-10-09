@@ -1,28 +1,35 @@
-# Spark side of the remote Kimodo lane: what kimodo_service.py needs.
-# (The Windows side needs nothing new: it runs on mirroring\venv, stdlib urllib for HTTP.)
+# Spark side of the remote Kimodo lane: what kimodo_service.py needs, in its own venv
+# at remote_kimodo_service/venv ON THE SPARK (`kaspar`, aarch64, GB10, CUDA 13).
+# Never on Windows: this is the torch/GPU stack the Windows venv must not have.
 #
-# ON THE SPARK (`kaspar`), NOTHING NEEDS INSTALLING. Inspected read-only 2026-10-07: the
-# venv the old OSC services use already has everything below -
-#   ~/project_kaspar/modules/kai-avatar-animation/pipeline-network-osc/venv
-#   kimodo 1.0.0, torch 2.13.0 (CUDA 13 build), fastapi 0.141.1, uvicorn 0.52.1,
-#   pydantic 2.13.4, numpy 2.5.1
-# Run the service with that venv's python (README.md, step 1).
+# Create it (Malte, in the SSH session; read-only for Claude):
 #
-# Only for a FRESH environment:
-#   1. torch: the CUDA build for the GB10 (aarch64) first - a plain `pip install torch`
-#      can pull a CPU-only wheel. The existing venvs used the PyPI torch 2.13.0 (cu13);
-#      the ARDY venv used --index-url https://download.pytorch.org/whl/cu132.
-#   2. kimodo: NOT from the git URL. Its MotionCorrection C++ extension needs local
-#      aarch64 patches (sse2neon.h, SIMD.h, CMakeLists.txt), which live in the patched
-#      checkout ~/kimodo-src. Install it from there:
-#          pip install --no-build-isolation ~/kimodo-src
-#   3. then this file:
-#          python3 -m pip install -r requirements.txt
+#   cd ~/project_kaspar/modules/kai-avatar-animation/remote_kimodo_service
+#   python3 -m venv venv
+#   venv/bin/python -m pip install --upgrade pip setuptools wheel
+#   # 1. torch FIRST, the CUDA build. A plain resolver run can pull a CPU-only wheel.
+#   #    torch 2.13.0 from PyPI is the CUDA 13 aarch64 build the working venv uses.
+#   venv/bin/python -m pip install torch==2.13.0
+#   venv/bin/python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"   # 13.0 True
+#   # 2. kimodo: NOT from the git URL. Its MotionCorrection C++ extension needs the local
+#   #    aarch64 patches (sse2neon.h, SIMD.h, CMakeLists.txt) in ~/kimodo-src. Its build
+#   #    backend is setuptools, which --no-build-isolation takes from this venv.
+#   venv/bin/python -m pip install --no-build-isolation ~/kimodo-src
+#   # 3. then this file:
+#   venv/bin/python -m pip install -r requirements.txt
+#
+# Start the service with it:   venv/bin/python kimodo_service.py
+#
+# Until this venv exists, the old one still works (it is untracked, so moving
+# pipeline-network-osc/ to _old/ left it where it was):
+#   ../pipeline-network-osc/venv/bin/python kimodo_service.py
+# Versions there, read 2026-10-09: Python 3.12.3, torch 2.13.0 (CUDA 13.0), kimodo 1.0.0,
+# transformers 5.1.0, fastapi 0.141.1, uvicorn 0.52.1, pydantic 2.13.4, numpy 2.5.1.
 
 # web service
-fastapi>=0.110
-uvicorn>=0.29
-pydantic>=2.0
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
 
 # NPZ contract (kimodo_contract.py)
-numpy
+numpy==2.5.1

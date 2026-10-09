@@ -1,0 +1,7 @@
+# mirroring/gui.py: drives both lanes, so it needs both, plus Pillow to show camera
+# frames in Tk (PIL.ImageTk). Tkinter itself ships with the python.org installer.
+# Pinned to the versions every acceptance test passed with on 2026-10-09.
+
+-r requirements-mirroring.txt
+-r requirements-procedural.txt
+Pillow==12.3.0

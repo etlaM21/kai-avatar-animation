@@ -11,7 +11,7 @@ nohup/systemd, no auto-restart.
                         X-Generation-Seconds, X-Queue-Seconds, X-Seed, X-Cache
     GET  /health     -> {"model", "loaded", "busy", ...}
 
-Rewritten from pipeline-network-osc/kimodo_service_handoff_osc_v3.py (left untouched).
+Rewritten from _old/pipeline-network-osc/kimodo_service_handoff_osc_v3.py (left untouched).
 Kept: FastAPI, the model loaded once and kept warm, an asyncio.Lock so a generation is
 never interrupted or overlapped, the shared HF cache, a timing log. Dropped: all OSC
 streaming, all quaternion swizzling, the WSL gateway lookup. This service returns raw

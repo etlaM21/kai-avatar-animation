@@ -73,3 +73,13 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# ---- kai-avatar-animation (Python) ----
+# The Windows venv lives at the module root (requirements.txt); the Spark's in
+# remote_kimodo_service/ (remote_kimodo_service/requirements.txt).
+venv/
+__pycache__/
+*.pyc
+# The Spark's previous service venv: untracked, so it stayed at this path when the
+# tracked pipeline-network-osc/ moved to _old/ (and lost that folder's .gitignore).
+pipeline-network-osc/venv/

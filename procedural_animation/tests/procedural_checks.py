@@ -1,8 +1,8 @@
 """
 Offline acceptance checks for the procedural retarget - no GPU, no Kimodo, no engine.
 
-    .\\mirroring\\venv\\Scripts\\python.exe procedural_animation\\tests\\procedural_checks.py
-    .\\mirroring\\venv\\Scripts\\python.exe procedural_animation\\tests\\procedural_checks.py clip.bvh ...
+    .\\venv\\Scripts\\python.exe procedural_animation\\tests\\procedural_checks.py
+    .\\venv\\Scripts\\python.exe procedural_animation\\tests\\procedural_checks.py clip.bvh ...
 
 procedural-animation.md sec. 5, tests 1-3:
 
@@ -80,7 +80,8 @@ from remote_kimodo_service.kimodo_client import GenerationFailed, KimodoClient, 
 from remote_kimodo_service.kimodo_contract import ContractError, GenerationRequest  # noqa: E402
 from remote_kimodo_service.player import LoopPlayer, Sender  # noqa: E402
 
-CLIP_DIRS = [MODULE_ROOT / "pipeline-network-editor" / "kimodo-gen", MODULE_ROOT / "kimodo" / "kimodo-gen"]
+CLIP_DIRS = [MODULE_ROOT / "assets" / "kimodo" / "clips" / "editor-gen",
+             MODULE_ROOT / "assets" / "kimodo" / "clips" / "kimodo-gen"]
 
 # Unreal component space from the source's (Y up, +Z fwd): stated independently of
 # source_skeletons.Y_UP_Z_FWD_TO_UE. Test 3 checks the absolute facts it implies.

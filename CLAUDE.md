@@ -15,8 +15,8 @@ The documents, and what each one is for:
 | File | What |
 |---|---|
 | `mirroring\README.md` | How both lanes work, in full detail (§2–8 live lane, §9 generated-motion lane) |
-| `mirroring\procedural-animation.md` | Research and plan for generated motion (Kimodo vs ARDY, retarget math, phases) |
-| `procedural_animation\remote-kimodo-streaming.md` | Network analysis for reaching the Spark |
+| `docs\procedural-animation.md` | Research and plan for generated motion (Kimodo vs ARDY, retarget math, phases) |
+| `docs\remote-kimodo-streaming.md` | Network analysis for reaching the Spark |
 | `remote_kimodo_service\README.md` | Operator's guide: start the service, the tunnel, play |
 | this file | The working guide: how to run things, what is load-bearing, what must not be re-broken, what is open |
 
@@ -37,8 +37,8 @@ The live lane lives in `mirroring\` and its commands below run from there; the v
 `mirroring\venv`. The procedural lane runs from the module root as modules:
 
 ```powershell
-.\mirroring\venv\Scripts\python.exe -m procedural_animation.procedural_conductor           # REPL
-.\mirroring\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor           # REPL
+.\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
 ```
 
 In `mirroring\`:
@@ -49,10 +49,10 @@ that silently falls back to system Python will fail in confusing ways (MediaPipe
 scipy are only installed in the venv).
 
 ```powershell
-.\venv\Scripts\python.exe conductor.py --debug --camera 1
-.\venv\Scripts\python.exe gui.py
-.\venv\Scripts\python.exe tests\solver_checks.py
-.\venv\Scripts\python.exe -m pip install <pkg>
+..\venv\Scripts\python.exe conductor.py --debug --camera 1
+..\venv\Scripts\python.exe gui.py
+..\venv\Scripts\python.exe tests\solver_checks.py
+..\venv\Scripts\python.exe -m pip install <pkg>
 ```
 
 In the debug window: `c` calibrates, `Esc` quits.
@@ -421,8 +421,8 @@ zero reference for both lanes.
 ### Live lane
 
 ```powershell
-.\venv\Scripts\python.exe tests\solver_checks.py            # all recordings\*.npz
-.\venv\Scripts\python.exe tests\solver_checks.py some.npz   # one capture
+..\venv\Scripts\python.exe tests\solver_checks.py            # all recordings\*.npz
+..\venv\Scripts\python.exe tests\solver_checks.py some.npz   # one capture
 ```
 
 No camera needed. Asserted checks exit with code 1 on failure; real-capture checks
@@ -505,7 +505,7 @@ Not solver error.
 ### Recording new captures
 
 ```powershell
-.\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\name.npz
+..\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\name.npz
 ```
 
 Raw landmarks (pre-solve, pre-smoothing), so recordings stay useful across solver

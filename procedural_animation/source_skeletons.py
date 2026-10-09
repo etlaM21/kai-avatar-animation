@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation as R
 from . import MODULE_ROOT
 from .bvh_reader import BvhClip, BvhJoint, read_bvh
 
-SOMA77_TPOSE_BVH = MODULE_ROOT / "kimodo" / "soma_skeleton" / "somaskel77_standard_tpose.bvh"
+SOMA77_TPOSE_BVH = MODULE_ROOT / "assets" / "kimodo" / "soma_skeleton" / "somaskel77_standard_tpose.bvh"
 
 # Source (right-handed, Y up, +Z forward, +X = character's left) -> Manny component
 # space (+X = character's left, +Y forward, +Z up): (x, y, z) -> (x, z, y).

@@ -1,10 +1,10 @@
 """
 Offline acceptance checks for pose_solver.py - no camera needed.
 
-    .\\venv\\Scripts\\python.exe tests\\solver_checks.py                   # checks 1+2, plus every recordings/*.npz
-    .\\venv\\Scripts\\python.exe tests\\solver_checks.py some_capture.npz  # checks 1+2, plus that file
+    ..\\venv\\Scripts\\python.exe tests\\solver_checks.py                   # checks 1+2, plus every recordings/*.npz
+    ..\\venv\\Scripts\\python.exe tests\\solver_checks.py some_capture.npz  # checks 1+2, plus that file
 
-Record a capture with:  .\\venv\\Scripts\\python.exe conductor.py --debug --camera 1 --record recordings\\name.npz
+Record a capture with:  ..\\venv\\Scripts\\python.exe conductor.py --debug --camera 1 --record recordings\\name.npz
 
 1. Rest-pose identity. The rig's own bind pose, expressed as MediaPipe landmarks,
    must solve back to BIND_POSES (22 body bones) and each finger's bind rotation

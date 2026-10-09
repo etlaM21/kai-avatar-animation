@@ -2,10 +2,10 @@
 Unreal head-rotation probe - streams KNOWN inputs to a running editor so the
 MetaHuman's response can be read off, instead of reasoned about.
 
-    .\\venv\\Scripts\\python.exe tests\\ue_head_probe.py                    # every stage in turn
-    .\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --stage q2-torso-yaw
-    .\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --value 1.0         # bigger curve input
-    .\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --measure           # read bones back, numerically
+    ..\\venv\\Scripts\\python.exe tests\\ue_head_probe.py                    # every stage in turn
+    ..\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --stage q2-torso-yaw
+    ..\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --value 1.0         # bigger curve input
+    ..\\venv\\Scripts\\python.exe tests\\ue_head_probe.py --measure           # read bones back, numerically
 
 Stop conductor.py first: both would be sending to the same ports. --measure needs
 Project Settings > Python > Enable Remote Execution in the editor.
