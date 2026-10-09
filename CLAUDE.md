@@ -21,6 +21,7 @@ The documents, and what each one is for:
 | `docs\remote-kimodo-streaming.md` | Network analysis for reaching the Spark |
 | `remote_kimodo_service\README.md` | Operator's guide: start the service, the tunnel, play |
 | `_old\README.md` | What was archived on 2026-10-09, and what replaced each piece |
+| `TODO.md` | Malte's open steps, with the exact commands to run |
 | this file | The working guide: how to run things, what is load-bearing, what must not be re-broken, what is open |
 
 ## Working agreement
@@ -694,21 +695,11 @@ and restart (anything that joins) report through one event queue drained via
 
 ### For you (Malte)
 
-- **Test the solver in UE** if not already done: calibrate upright once, then turn and
-  nod, rotate wrists palm-up/down, spread and curl fingers, crouch, lean out of frame.
-  Confirm the state of branch `feature/solver-fixes` (merged or not).
-- **Record an occlusion clip** if you want the gating thresholds tuned harder: lean
-  over the desk until the legs leave frame, step half out of shot, put one arm behind
-  your back.
-- **Optional: the direct-port check** (Spark access section). The tunnel works, so this
-  only matters if you want to drop it.
-- **Request Llama-3-8B-Instruct access on Hugging Face** before the ARDY phase.
-- **On the Spark:** `git pull` (it is at `9e47bd2`; the new 33-step default and the
-  moved folders arrive with it), then create `remote_kimodo_service/venv` per
-  `remote_kimodo_service/requirements.txt` and start the service with it. The old
-  `pipeline-network-osc/venv` keeps working meanwhile.
-- **On Windows:** delete the obsolete `mirroring\venv` once you are happy with the root
-  `venv\` (its pip is broken - a half-finished upgrade - and it holds both OpenCV builds).
+**Kept in `TODO.md`** (module root), with the exact commands for each step: publish
+the branch, pull on the Spark and create its venv, run the GUI for real, delete the old
+venvs, plus the older items (solver test in UE, occlusion clip, HF access, direct-port
+check). Keep that file the single list: add new to-dos for Malte there, with commands,
+and remove what is done.
 
 ### Not started
 
