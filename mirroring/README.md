@@ -521,7 +521,8 @@ venv/bin/python kimodo_service.py
 It loads the model (~25 s) and prints `Model loaded`. It runs in the foreground and
 stops when you log out or press `Ctrl+C`, on purpose: no tmux, no systemd, no
 auto-restart. `remote_kimodo_service/venv` is the service's own venv; how to create it
-(CUDA torch first, then Kimodo from the aarch64-patched `~/kimodo-src`, then the pinned
+(CUDA torch first, the prebuilt scenepic wheel from `~/wheels`, then Kimodo from the
+aarch64-patched `~/kimodo-src`, then the pinned
 packages) is in `remote_kimodo_service/requirements.txt`. Until it exists, the old one
 works: `../pipeline-network-osc/venv/bin/python kimodo_service.py` (untracked, so it
 stayed at that path when the old pipeline moved to `_old/`).

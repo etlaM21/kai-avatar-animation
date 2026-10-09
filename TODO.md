@@ -56,9 +56,16 @@ venv/bin/python -m pip install --upgrade pip setuptools wheel
 venv/bin/python -m pip install torch==2.13.0
 venv/bin/python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"
 #   must print:  13.0 True    - if it says None / False, stop: a CPU wheel came in
+venv/bin/python -m pip install ~/wheels/scenepic-1.1.2-cp312-cp312-linux_aarch64.whl
 venv/bin/python -m pip install --no-build-isolation ~/kimodo-src
 venv/bin/python -m pip install -r requirements.txt
 ```
+
+  The scenepic line comes before Kimodo: scenepic is a Kimodo dependency with no aarch64
+  wheel on PyPI, and its source package cannot build without an npm step (CMake error
+  `dist/scenepic.min.js: No such file`). `~/wheels` holds the one you built in August.
+  If you already ran the steps without it: run just the last three lines, the venv and
+  torch are fine.
 
 - [ ] Start the service with it (from now on, every session):
 

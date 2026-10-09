@@ -11,11 +11,17 @@
 #   #    torch 2.13.0 from PyPI is the CUDA 13 aarch64 build the working venv uses.
 #   venv/bin/python -m pip install torch==2.13.0
 #   venv/bin/python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"   # 13.0 True
-#   # 2. kimodo: NOT from the git URL. Its MotionCorrection C++ extension needs the local
+#   # 2. scenepic, a kimodo dependency, from the wheel Malte built in August 2026.
+#   #    PyPI has no aarch64 wheel, and its sdist lacks dist/scenepic.min.js (made by
+#   #    `npm run build`), so a plain install fails in CMake ("scenepic.min.js: No such
+#   #    file"). The wheel came from ~/scenepic (microsoft/scenepic 1.1.2, npm run build,
+#   #    then `pip wheel ~/scenepic -w ~/wheels`); rebuild it the same way if it is lost.
+#   venv/bin/python -m pip install ~/wheels/scenepic-1.1.2-cp312-cp312-linux_aarch64.whl
+#   # 3. kimodo: NOT from the git URL. Its MotionCorrection C++ extension needs the local
 #   #    aarch64 patches (sse2neon.h, SIMD.h, CMakeLists.txt) in ~/kimodo-src. Its build
 #   #    backend is setuptools, which --no-build-isolation takes from this venv.
 #   venv/bin/python -m pip install --no-build-isolation ~/kimodo-src
-#   # 3. then this file:
+#   # 4. then this file:
 #   venv/bin/python -m pip install -r requirements.txt
 #
 # Start the service with it:   venv/bin/python kimodo_service.py

@@ -44,8 +44,8 @@ The CLI is `procedural_animation/procedural_conductor.py`.
 The Spark (hostname `kaspar`, Tailscale `100.83.6.8`) has a clone of this repo at
 `~/project_kaspar/modules/kai-avatar-animation`; `git pull` there brings in new code.
 The service has its own venv, `remote_kimodo_service/venv`; `requirements.txt` here is
-the recipe to create it once (CUDA torch first, then Kimodo from the aarch64-patched
-`~/kimodo-src`, then the pinned packages).
+the recipe to create it once (CUDA torch first, then the prebuilt scenepic wheel from
+`~/wheels`, then Kimodo from the aarch64-patched `~/kimodo-src`, then the pinned packages).
 
 ```bash
 cd ~/project_kaspar/modules/kai-avatar-animation/remote_kimodo_service
