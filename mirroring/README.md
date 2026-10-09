@@ -114,8 +114,9 @@ order or field names.
 
 Needs `holistic_landmarker.task` next to `conductor.py` (download link in
 `mediapipe_holistic_capture.py`'s docstring). `face_landmarker.task` is only
-needed if `head_pose_capture.py` is ever reinstated; `pose_landmarker_full.task`
-is a leftover from before the Holistic migration - nothing loads either today.
+needed if `head_pose_capture.py` is ever reinstated (nothing loads it today). Run
+from `mirroring\`: the model paths are relative to the working directory. The venv is
+the module's single one at the root (`..\venv`, created from `..\requirements.txt`).
 In the debug window, press `c` while standing upright to calibrate (a 3 s
 countdown, then lean and neutral head pose averaged over 30 frames), `Esc` to
 quit. MediaPipe's forward-lean bias is not constant across setups (~18° in
@@ -152,7 +153,7 @@ prints them against the rest stage, so questions about what Unreal does with a
 signal are answered with numbers rather than by eye. Stop `conductor.py` first -
 both send to the same ports.
 
-Or drive the same pipeline from a GUI instead of the terminal:
+Or drive both lanes from a GUI instead of the terminal (from `mirroring\`):
 
 ```powershell
 ..\venv\Scripts\python.exe gui.py
@@ -160,10 +161,15 @@ Or drive the same pipeline from a GUI instead of the terminal:
 
 ### GUI control surface (`gui.py`)
 
-A single-window Tkinter wrapper around `Conductor` - it does not reimplement
-any tracking/smoothing/solving logic, only drives a `Conductor` instance
-through its constructor and public attributes. `python conductor.py --debug
---camera 1` keeps working from the command line exactly as before.
+One Tkinter window with two tabs, and **the tab is the lane switch**: the Tracking tab
+is the webcam lane, the Prompt tab the generated-motion lane (§9), and only the lane
+whose tab shows may send to 9001/11111. A strip along the bottom always says who is
+sending, to where. The GUI reimplements no tracking, solving, retargeting or network
+logic: it drives a `Conductor` through its constructor and public attributes, and the
+procedural lane through the same pieces the CLI uses. `python conductor.py --debug
+--camera 1` and `procedural_conductor` keep working exactly as before.
+
+#### Tracking tab
 
 - **Live pane** shows the same annotated frame `conductor.py`'s own debug
   window would. The window **height follows the camera's aspect**: at a given
@@ -187,7 +193,7 @@ through its constructor and public attributes. `python conductor.py --debug
   calibrating on a performer who matches the rig is a no-op.
 - **Restart-required controls**, grouped under a collapsible, scrollable
   **Advanced** section (collapsed by default): capture resolution, model
-  path, face/pose target IP:port, and Holistic confidence thresholds.
+  path, face/pose target IP:port (shared by both lanes), and Holistic confidence thresholds.
   Changing any of these (or the camera index) while running marks the panel
   dirty and enables **Apply & Restart** instead of silently doing nothing.
 - **How it gets frames out and stops cleanly**, since `Conductor` owns the
@@ -197,12 +203,62 @@ through its constructor and public attributes. `python conductor.py --debug
   reusing `Conductor.run()`'s own existing exit path instead of inventing a
   new one; `namedWindow`/`resizeWindow` → no-ops) before ever constructing a
   `Conductor`, and runs `Conductor.run()` on a daemon thread, joined with a
-  timeout on Stop/restart/window-close so the camera is never left held by
+  timeout (on a background thread, so the window never freezes) on
+  Stop/restart/lane switch/window-close so the camera is never left held by
   an orphaned thread.
 - `mediapipe_holistic_capture.py` takes the confidence thresholds as optional
   constructor kwargs, all defaulting to `0.5`. (`head_pose_capture.py` has the
   same, unused while it is disabled; its GUI fields are commented out with it.)
-- Needs `Pillow` (`PIL.ImageTk`), added to `requirements.txt`.
+- Needs `Pillow` (`PIL.ImageTk`), in `requirements-gui.txt`.
+
+#### Prompt tab
+
+- **Prompt** entry + Generate (Enter works; inline `/s 25 /t 4 /seed 7|random` too,
+  exactly as in the REPL). A bad option is a one-line message under the entry.
+- **Now playing**, highlighted: badge, prompt, seed · length · steps, its generation
+  time, pass number and a progress bar for the current pass.
+- **Queue**, in play order: GENERATING (with a live `generating… 3.2 s` counter),
+  WAITING (`2nd in line`: one request is in flight at a time), READY. ▲▼ reorder ready
+  clips, Remove / Clear drop them (a clip that is generating still lands in the cache),
+  Next cuts to the next clip, Stop playback ends the session.
+- **History** of the session (played, not played, failed, cancelled) with Replay - a
+  replayed prompt is a cache hit.
+- **Library**: the cache, newest first, with each clip's original generation time;
+  double-click to queue. **Play file…** plays a BVH (either Kimodo convention) or NPZ.
+- **Spark indicator**: `/health` every 5 s while the tab shows - green idle, amber busy
+  or loading, red with the one-line reason (tunnel down, service down, timeout).
+- **Generation time** everywhere: a fresh clip shows the Spark's GPU time + link time
+  (+ queue time if it waited for the GPU); a cached clip shows its original GPU time and
+  date, read from the `generation_s` / `created` the Spark writes into every NPZ.
+- **Parameters**, with their defaults shown; every CLI option is there:
+
+  | GUI | Default | CLI | When it applies |
+  |---|---|---|---|
+  | Length (s) | 9 (max 10) | `--seconds` / `/t` | next prompt |
+  | Denoising steps | 33 | `--steps` / `/s` | next prompt |
+  | Seed + random | 0 | `--seed` / `/seed` | next prompt |
+  | Loop | **on** (as the REPL; the CLI's one-shot plays once) | `--loop` | live |
+  | Stay in place | off | (Phase 0's `--root in-place`) | clips finishing after the change |
+  | Speed | 1.0 | `--speed` | from the next clip |
+  | Advanced: Spark URL, timeout, cache dir, model, send rate, head channel, dry run | as the CLI | `--spark-url --timeout --cache-dir --model --rate --no-face --dry-run` | **Apply** |
+
+  "Stay in place" pins the pelvis X/Y to the clip's first frame (height kept), so a
+  travelling clip loops on the spot; rotations and the head channel are untouched. With
+  loop off, the player sends present=0 after the last clip instead of freezing on it.
+
+#### The lane switch
+
+- **Tracking → Prompt:** the conductor is stopped and joined (camera released). Then one
+  handoff: its last pose with present=0 (Conductor sends nothing when it stops) and a
+  Live Link Face packet with neutral blendshapes that keeps the head where it was. Only
+  then is the procedural player created.
+- **Prompt → Tracking:** the player stops (its last pose with present=0). The playing
+  clip ends; ready clips are "not played"; waiting requests are cancelled before they
+  are sent; **a request in flight finishes into the cache but is not played**. The
+  webcam restarts only if it was running when you left.
+- **A sender that will not stop blocks the switch** (2 s), and the tab flips back with
+  a message - never two senders at once. All of this runs off the Tk thread;
+  `tests\gui_checks.py` checks it offline (§9.13).
 
 ### Orphaned files, kept but not live
 
@@ -215,12 +271,11 @@ through its constructor and public attributes. `python conductor.py --debug
 - `mediapipe_pose_osc_protocol.py` - imported by `conductor.py` but only
   reachable through dead code (a `'''...'''`-quoted block after an unconditional
   `return`-equivalent). Predates `pose_solver.py`/OSC-bone-transform encoding.
-- `live_link_pose_json_protocol.py` - not imported anywhere. An alternate
-  JSON-based pose wire format that was never wired into `conductor.py`.
-- `ue_plugin/` (this repo) - the plugin's original home; superseded by a
-  synced copy at `K:\KaiTracking\Plugins\MediaPipeLiveLink`, which is the one
-  the project's `.uproject` now actually builds (see §5). Edit the C++ there,
-  not here - this copy no longer participates in the build.
+  Stays here: the import runs at load, so archiving it means editing `conductor.py`.
+- Archived to `_old\mirroring\` on 2026-10-09 (see `_old\README.md`):
+  `live_link_pose_json_protocol.py` (imported nowhere), `pose_landmarker_full.task`
+  (loaded by nothing) and the stale `ue_plugin/` copy - the plugin is built from
+  `K:\KaiTracking\Plugins\MediaPipeLiveLink` (see §5); edit the C++ there.
 
 ## 3. Why two transport lanes instead of one
 
@@ -240,7 +295,7 @@ custom `ILiveLinkSource` regardless of wire format.
 Not a universal "OSC beats JSON" claim:
 
 1. **Kimodo/SOMA already emitted OSC** in the earlier service experiments
-   (`pipeline-network-osc/`) - standardizing the pose lane on OSC meant one parser
+   (now `_old/pipeline-network-osc/`) - standardizing the pose lane on OSC meant one parser
    in the plugin instead of two. As built, the generated-motion lane (§9) does not
    stream from the GPU machine at all: it retargets on Windows and sends the very
    same `/mediapipe/pose` packet as the webcam lane, so the plugin has exactly one
@@ -256,8 +311,8 @@ weren't already a given, JSON would be an equally reasonable choice.
 
 ## 5. Custom `ILiveLinkSource` plugin - what's actually built
 
-Lives at `K:\KaiTracking\Plugins\MediaPipeLiveLink` (this repo's `ue_plugin/`
-copy is stale - see §2). Simpler than the DollarsMoCap-derived design
+Lives at `K:\KaiTracking\Plugins\MediaPipeLiveLink` (this repo's old copy is
+archived in `_old\mirroring\ue_plugin\` and stale - see §2). Simpler than the DollarsMoCap-derived design
 originally sketched here:
 
 - **One class, `FMediaPipeLiveLinkSource`**, implements `ILiveLinkSource` and
@@ -392,20 +447,21 @@ MediaPipe and Kimodo (§9), since both drive the same Manny proxy.
   module, dynamic bone count, multi-subject-ready, driving Manny live.
 - **Debug overlay** - full pose/face-mesh/hand landmark drawing, tracking
   status per channel, live torso-lean readout + one-key calibration.
-- **GUI control surface** (`gui.py`, §2) - Tkinter wrapper driving a
-  `Conductor`: window height fitted to the camera's aspect (no letterbox, no
-  crop), camera index in the video toolbar, POSE/FACE tracking status next to
-  the FPS, smoothing sliders reading 0 = raw, calibration up front, a
-  scrollable restart-required Advanced section, and clean Start/Stop with no
-  orphaned camera handles.
+- **GUI control surface** (`gui.py`, §2) - one Tkinter window for both lanes. Tracking
+  tab: drives a `Conductor` (window height fitted to the camera's aspect, camera index
+  in the video toolbar, POSE/FACE tracking status, smoothing sliders reading 0 = raw,
+  calibration up front, a scrollable restart-required Advanced section, clean
+  Start/Stop with no orphaned camera handles). Prompt tab (2026-10-09): prompt, now
+  playing, editable queue, history, cache library, Spark indicator, generation time per
+  clip. Switching tabs switches which lane sends, never both.
 - **Unreal head probe** (`tests/ue_head_probe.py`, §2) - known inputs in,
   MetaHuman bone rotations read back out of the editor.
 - **Generated-motion lane, Phase 0 + 1** (§9) - Kimodo SOMA77 clips retargeted onto
   Manny with the solver's own technique (bone directions exact against the source,
   head and root motion included); saved BVH clips play offline; prompts typed on the
   laptop are generated on the DGX Spark, cached, checked and played into Unreal
-  through the unchanged encoders, plugin and MetaHuman setup. 55 offline acceptance
-  checks, including a real Kimodo clip.
+  through the unchanged encoders, plugin and MetaHuman setup. 56 offline acceptance
+  checks, including a real Kimodo clip; 26 more for the GUI's lane switch.
 
 ## 9. Generated-motion lane: Kimodo on the DGX Spark
 
@@ -420,7 +476,7 @@ explanation.
 ### 9.1 The whole picture
 
 ```
- DGX Spark "kaspar" (GB10, aarch64)          Windows laptop (mirroring venv, no torch)                     Unreal 5.8
+ DGX Spark "kaspar" (GB10, aarch64)          Windows laptop (root venv, no torch)                          Unreal 5.8
 ┌─────────────────────────────────┐        ┌───────────────────────────────────────────────────────┐     ┌──────────────┐
 │ kimodo_service.py  (FastAPI)    │        │ procedural_conductor.py                               │     │ MediaPipe-   │
 │  127.0.0.1:8765                 │  SSH   │  main thread: REPL  ─┐                                │     │ LiveLink     │
@@ -459,14 +515,16 @@ Design rules behind this shape (measured reasons in
 ```bash
 cd ~/project_kaspar/modules/kai-avatar-animation && git pull
 cd remote_kimodo_service
-../pipeline-network-osc/venv/bin/python kimodo_service.py
+venv/bin/python kimodo_service.py
 ```
 
 It loads the model (~25 s) and prints `Model loaded`. It runs in the foreground and
 stops when you log out or press `Ctrl+C`, on purpose: no tmux, no systemd, no
-auto-restart. The existing `pipeline-network-osc/venv` already has Kimodo 1.0.0
-(installed from the aarch64-patched `~/kimodo-src`), CUDA torch and FastAPI;
-`remote_kimodo_service/requirements.txt` explains a fresh setup.
+auto-restart. `remote_kimodo_service/venv` is the service's own venv; how to create it
+(CUDA torch first, then Kimodo from the aarch64-patched `~/kimodo-src`, then the pinned
+packages) is in `remote_kimodo_service/requirements.txt`. Until it exists, the old one
+works: `../pipeline-network-osc/venv/bin/python kimodo_service.py` (untracked, so it
+stayed at that path when the old pipeline moved to `_old/`).
 
 **On the laptop, the tunnel** (a second PowerShell window, left open):
 
@@ -479,7 +537,9 @@ network can reach it. `-L` makes that port appear on the laptop as `127.0.0.1:87
 carried inside the SSH connection. After the password it prints nothing; that is the
 working state. `curl.exe -s http://127.0.0.1:8765/health` checks the whole chain.
 
-**On the laptop, play** (from the module root; stop `conductor.py` first):
+**On the laptop, play** - either in the GUI (`..\venv\Scripts\python.exe gui.py` from
+`mirroring\`, Prompt tab; it stops the webcam lane itself), or from the command line
+(from the module root; stop `conductor.py` first):
 
 ```powershell
 # REPL
@@ -495,7 +555,7 @@ working state. `curl.exe -s http://127.0.0.1:8765/health` checks the whole chain
 |---|---|---|
 | `--prompt` / `--bvh` / `--clip` | none = REPL | the source; mutually exclusive |
 | `--seconds` | 9 | clip length, max 10 (Kimodo's limit per prompt) |
-| `--steps` | 100 | denoising steps |
+| `--steps` | 33 | denoising steps (100 until 2026-10-09; the Spark's default follows) |
 | `--seed` | 0 | an integer or `random` |
 | `--spark-url` | `http://127.0.0.1:8765` (env `KIMODO_URL`) | the tunnel's end |
 | `--timeout` | 60 s (env `KIMODO_TIMEOUT`) | per request |
@@ -552,7 +612,7 @@ touching the network at all.
 ### 9.5 Stage 3 — the request (`kimodo_client.py`)
 
 On a miss: `POST /generate` with `{prompt, seed, num_frames, steps, model}` as JSON,
-stdlib `urllib` only (the mirroring venv has no HTTP library and needs none). The
+stdlib `urllib` only (the Windows venv has no HTTP library and needs none). The
 request is synchronous with a 60 s timeout; nothing else waits on it.
 
 Every failure leaves the client as one of two exceptions with a one-line message,
@@ -749,8 +809,12 @@ the player's queue.
   - **Head → Live Link Face, UDP 11111:** a 61-channel packet with all blendshapes
     at 0 (Kimodo has no face) and `headYaw/Pitch/Roll` from
     `head_rotation_to_curves(head_rotation)`.
-  - **On stop:** the last pose once more with `present = 0.0`, the same
-    "tracking lost" signal `conductor.py` sends.
+  - **On stop:** the last pose once more with `present = 0.0` - the "tracking lost"
+    signal `conductor.py` sends while running when it loses the performer. (Conductor
+    itself sends nothing when it is stopped; the GUI sends that packet for it on a
+    lane switch.)
+- **Queue editing (GUI):** `clear_pending()` takes the queued clips back out in order;
+  the GUI removes or reorders and enqueues the rest again. The CLI never calls it.
 
 ### 9.11 Stage 9 — Unreal
 
@@ -767,8 +831,9 @@ over a direct Tailscale connection:
 
 | Steps | Generation | Transfer (~890 KB) |
 |---|---|---|
-| 100 (default) | 5.8 s warm (7.3 s on the first request after start) | 0.3–1.3 s |
+| 100 (default until 2026-10-09) | 5.8 s warm (7.3 s on the first request after start) | 0.3–1.3 s |
 | 50 | 2.9 s | |
+| 33 (default now) | not timed yet | |
 | 25 | 1.5 s | |
 | 10 | 0.7 s | |
 
@@ -784,7 +849,7 @@ positions; the face-channel head decodes to the body's head exactly.
 .\venv\Scripts\python.exe procedural_animation\tests\procedural_checks.py
 ```
 
-No GPU, no Spark, no engine; 55 checks, exit code 1 on any failure. As in
+No GPU, no Spark, no engine; 56 checks, exit code 1 on any failure. As in
 `solver_checks.py`, ground truth is independent of the retarget's own tables
 (anatomical joint correspondence, an Unreal-style FK written in the test).
 
@@ -795,14 +860,20 @@ No GPU, no Spark, no engine; 55 checks, exit code 1 on any failure. As in
 | 3 | Change of basis: walk +Z → Manny +Y; a left turn faces +X (an inverted rotation would face −X); left arm raise lifts `upperarm_l` only |
 | 4 | Head channel: the Live Link Face curves decode to the sent body's head, every frame |
 | 5 | Wire format: `/mediapipe/pose`, 421 floats, conductor.py's bone order |
-| 5b | Player, real time: loops, hand-over at the end of a pass, 421-float packets, present 1 → 0 on stop, ~60 Hz |
-| 6 | Client resilience against stub servers: refused, accept-and-close, timeout, HTTP 500, malformed NPZ; nothing cached, the player keeps sending; a cache hit never touches the network; prompt options |
+| 5b | Player, real time: loops, hand-over at the end of a pass, 421-float packets, present 1 → 0 on stop, ~60 Hz; `clear_pending()` returns the queue in order while the current clip keeps playing |
+| 6 | Client resilience against stub servers: refused, accept-and-close, timeout, HTTP 500, malformed NPZ; nothing cached, the player keeps sending; a cache hit never touches the network; prompt options; `fetch_detailed()` reports timings + cache file on a miss, the same NPZ meta and no request on a hit |
 | 7 | NPZ contract: NPZ path == BVH path (both conventions), exact keys/shapes/dtypes, metres; transposed, cm, reordered, NaN, missing key, truncated → refused; a **real Kimodo clip** (`tests/fixtures/kimodo_real_turn_around_2s.npz`) passes the self-check and direction truth |
 
 `remote_kimodo_service/fake_kimodo_server.py` is a stdlib stand-in for the service
 (clips built from the BVH library, plus failure modes); the tests use it, and it can
-replace the Spark for offline REPL work:
+replace the Spark for offline REPL or GUI work:
 `.\venv\Scripts\python.exe -m remote_kimodo_service.fake_kimodo_server --delay 3`.
+
+The GUI's lane switch has its own offline checks (26, from `mirroring\`):
+`..\venv\Scripts\python.exe tests\gui_checks.py` - no overlap between the lanes'
+packets across Tracking → Prompt → Tracking, a hung webcam thread blocks the switch, a
+generation in flight lands in the cache unplayed, the exact handoff packets over real
+UDP, queue editing and player restart, the generation-time text.
 
 ### 9.14 Known limits
 
@@ -831,13 +902,14 @@ Generated-motion lane:
   ended, with heading alignment (the face channel's head rotation must be turned by
   the same yaw, or head and body disagree); a per-bone slerp crossfade (~0.3 s); an
   idle loop; a stage box.
-- **Steps vs quality:** judge in Unreal which step count is good enough (25 steps is
-  4× faster than 100) and pick the default.
+- **The GUI's Prompt tab, for real:** checked offline and in a scripted run against the
+  fake server, not yet with the camera, the real Spark and Unreal together - including
+  what Manny and the MetaHuman do on the present=0 handoff.
+- **Steps:** the default is 33 (Malte, 2026-10-09); time it on the GB10.
 - **Chaining** (`first_frame`, reserved in the request schema): a full-body keyframe
   constraint on frame 0 so consecutive clips continue without a cut.
 - **Later phases:** ARDY-Core streaming (prompt changes mid-motion), a mixer with the
-  webcam lane ("AI body, webcam face and hands"), ARDY-SOMA when released, a
-  "Procedural" tab in `gui.py` (`procedural-animation.md` §6).
+  webcam lane ("AI body, webcam face and hands"), ARDY-SOMA when released.
 
 Live lane:
 
@@ -870,8 +942,7 @@ Live lane:
 - **Finger twist**: unconstrained, same limitation as body twist - MediaPipe
   gives joint positions, not rotations, so finger roll can't be observed.
   (Wrist roll can, from the palm plane - §8.)
-- **Cleanup candidates**: the orphaned files in §2 (`mediapipe_pose_osc_protocol.py`,
-  `live_link_pose_json_protocol.py`, `pose_landmarker_full.task`, this repo's
-  `ue_plugin/` copy) could be removed once nobody needs them as reference.
+- **Cleanup** (done 2026-10-09): unused files and the old Kimodo pipelines are in
+  `_old\` (`_old\README.md`); `mediapipe_pose_osc_protocol.py` stays, see §2.
 - Benchmark Full Body IK vs. Body Mover + Limb IK Solvers for the MetaHuman
   retarget (§6).

@@ -3,7 +3,8 @@
 Research notes, comparison and integration plan. Written 2026-09-28 against
 `nv-tlabs/kimodo` and `nv-tlabs/ardy` at their `main` heads, the ARDY paper
 (arXiv 2607.08741), the Hugging Face model cards, and this repo's earlier Kimodo
-attempts (`kimodo/`, `pipeline-network-editor/`, `pipeline-network-osc/`).
+attempts (`kimodo/`, `pipeline-network-editor/`, `pipeline-network-osc/` - archived in `_old/`
+since 2026-10-09; the `kimodo-gen/` clip library is now `assets/kimodo/clips/`).
 
 > **Status, 2026-10-07: Phases 0 and 1 are built and working.** Saved BVH clips and
 > prompts generated on demand on the DGX Spark both drive the MetaHuman through the

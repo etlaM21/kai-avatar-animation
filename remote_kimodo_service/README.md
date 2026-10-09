@@ -43,13 +43,18 @@ The CLI is `procedural_animation/procedural_conductor.py`.
 
 The Spark (hostname `kaspar`, Tailscale `100.83.6.8`) has a clone of this repo at
 `~/project_kaspar/modules/kai-avatar-animation`; `git pull` there brings in new code.
-Nothing needs installing: the old OSC service's venv already has Kimodo, CUDA torch
-and FastAPI (see `requirements.txt` for a fresh setup).
+The service has its own venv, `remote_kimodo_service/venv`; `requirements.txt` here is
+the recipe to create it once (CUDA torch first, then Kimodo from the aarch64-patched
+`~/kimodo-src`, then the pinned packages).
 
 ```bash
 cd ~/project_kaspar/modules/kai-avatar-animation/remote_kimodo_service
-../pipeline-network-osc/venv/bin/python kimodo_service.py      # 127.0.0.1:8765; wait for "Model loaded"
+venv/bin/python kimodo_service.py      # 127.0.0.1:8765; wait for "Model loaded"
 ```
+
+Until that venv exists, the old OSC service's venv works the same (it already has
+Kimodo, CUDA torch and FastAPI, and stayed at its old path when that folder moved to
+`_old/`): `../pipeline-network-osc/venv/bin/python kimodo_service.py`.
 
 The service runs in the foreground of your SSH session and **stops when you log out**,
 on purpose. `Ctrl+C` stops it too. Loading the model takes ~25 s; until then the port
@@ -79,7 +84,10 @@ tailnet allows that port; the tunnel always works where SSH works.)
 
 ## 3. Play
 
-From the repo root (`kai-avatar-animation`):
+In the GUI - from `mirroring\`, `..\venv\Scripts\python.exe gui.py`, then the **Prompt**
+tab (it stops the webcam lane itself; queue, history, cache library, Spark indicator,
+generation time per clip). Or from the command line, from the repo root
+(`kai-avatar-animation`):
 
 ```powershell
 # REPL: type prompts; the current clip loops while the next one generates
@@ -99,7 +107,7 @@ Inline options, anywhere in a prompt:
 
 | | |
 |---|---|
-| `/s 25` | 25 denoising steps (default 100; fewer = faster, rougher) |
+| `/s 25` | 25 denoising steps (default 33; fewer = faster, rougher) |
 | `/seed 7`, `/seed random` | seed (default 0, so the same prompt is an instant cache hit) |
 | `/t 4` | 4 seconds (default 9, max 10) |
 
