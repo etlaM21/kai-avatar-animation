@@ -834,7 +834,7 @@ over a direct Tailscale connection:
 |---|---|---|
 | 100 (default until 2026-10-09) | 5.8 s warm (7.3 s on the first request after start) | 0.3–1.3 s |
 | 50 | 2.9 s | |
-| 33 (default now) | not timed yet | |
+| 33 (default now) | 2.0–2.1 s (read from the GUI, 2026-10-13) | 0.8–1.6 s |
 | 25 | 1.5 s | |
 | 10 | 0.7 s | |
 
@@ -880,7 +880,13 @@ UDP, queue editing and player restart, the generation-time text.
 
 - **Head yaw beyond 75°.** The face-channel head curves are absolute; Unreal was only
   measured linear to 75°, and generated motion turns the whole body (7 of 243 library
-  clips reach ±180°, where the Euler yaw also wraps). Open problem, §10.
+  clips reach ±180°, where the Euler yaw also wraps). Open problem, §10. Seen on
+  2026-10-13, by eye: a head at ~85° and a full turn through ±180° looked right, with
+  no flip at the wrap.
+- **Head pitch is Kimodo's.** The face channel reproduces Kimodo's head pitch within
+  0.1–0.5° (measured 2026-10-13, §10), so a raised or bowed head on the MetaHuman is in the
+  generated motion: some prompts and seeds stand with the head 20–25° up. Judge heads
+  from eye height; a camera at chest height looks up under the chin.
 - **No transitions yet:** hard cuts, no re-centring (§9.10).
 - **Hands** are Kimodo's static relaxed pose; **no face** animation (neutral
   blendshapes); max **10 s** per prompt; 30 fps source.
@@ -898,15 +904,54 @@ Generated-motion lane:
   one frame). What the MetaHuman does there is unmeasured, and the offline head test
   decodes with the same linear model, so it passes regardless. Next: a
   `tests/ue_head_probe.py` stage at 90/135/180°, then decide (cap the yaw, keep the
-  heading near the camera, or rely on Unreal if it stays linear).
+  heading near the camera, or rely on Unreal if it stays linear). The 2026-10-13 run
+  points to linear: ~85° and a full ±180° turn looked right, by eye.
+- **Head and neck on the MetaHuman (run of 2026-10-13, `261013_Kai_Kimodo_v2.mp4`).**
+  By eye: chin up while standing, the face upright while the torso hunched, the head
+  looking back in a turn, a fold in the collar. Measured offline on the cached clips that
+  played (real adapter, retarget and `head_rotation_to_curves`; Kimodo's head pitch taken
+  independently, from the elevation of Head → mid-eyes in `posed_joints` against the
+  T-pose BVH):
+
+  | Clip, moment | Sent head pitch | Kimodo's head | Torso lean |
+  |---|---|---|---|
+  | three jumping jacks, standing | +19…+26° | +19…+26° | +4…+7° |
+  | high fiving, standing | +8° | +8° | −3° |
+  | break dancing, hunched | −13° | −13° | +14° |
+  | sprints 100m, facing the camera | +14° | +13° | +3° |
+
+  Sent minus Kimodo is 0.1–0.5° while the body faces the camera (larger near 180° of
+  yaw only because an Euler pitch is not a character-relative pitch there). The T-pose
+  reference is level enough: quiet standing frames over 133 clips give a median of +5.5°
+  per clip. The turn is a look back over the shoulder in Kimodo's data (head −80° against
+  the chest). The Unreal camera stood at about chest height (the horizon crosses the
+  character's chest), which shows a level head from under the chin. So the retarget and
+  the face channel are exact; the look is Kimodo's motion plus the camera; the collar
+  fold is the neck seam listed under the live lane below.
+
+  Proposed, none implemented (awaiting Malte):
+  - **A. No change to the retarget or the face channel.** Add the measurement as a check
+    in `procedural_checks.py`: on the real fixture, the sent head pitch equals Kimodo's
+    position-derived pitch (frames facing the camera), so a future change that tilts
+    the head is caught by something independent of the retarget's own tables.
+  - **B. Judge heads from eye height** (no code): the Unreal camera at the MetaHuman's eye
+    height before calling a head wrong.
+  - **C. Optional head-pitch limit layer** in the player, off by default like "stay in
+    place": a soft limit on the head's pitch relative to the torso (e.g. ±15°), applied
+    alike to the body stream's `neck_01`/`head` and to the face channel's
+    `head_rotation`, so the two can never disagree. Only if B still shows heads that are
+    unwanted; steering by prompt or seed is the alternative that leaves the motion alone.
+  - **D. Measure the neck seam before deciding:** a `ue_head_probe.py` stage that replays
+    a generated clip and reads the Body and Face `neck_01`/`neck_02`/`head` back. The
+    known remedy (the `ABP_Face` layered-blend root moved to `FACIAL_C_FacialRoot`) is
+    the Epic-asset edit decided against (CLAUDE.md), so it waits for the numbers.
 - **Playback layers deferred from v1:** re-centring each clip on where the last one
   ended, with heading alignment (the face channel's head rotation must be turned by
   the same yaw, or head and body disagree); a per-bone slerp crossfade (~0.3 s); an
   idle loop; a stage box.
-- **The GUI's Prompt tab, for real:** checked offline and in a scripted run against the
-  fake server, not yet with the camera, the real Spark and Unreal together - including
-  what Manny and the MetaHuman do on the present=0 handoff.
-- **Steps:** the default is 33 (Malte, 2026-10-09); time it on the GB10.
+- **The GUI's Prompt tab, for real:** run with the real Spark and Unreal on 2026-10-13
+  (fresh and cached clips, queue, library, loop, stay in place). Still open, with the
+  camera: the lane switch, and what Manny and the MetaHuman do on the present=0 handoff.
 - **Chaining** (`first_frame`, reserved in the request schema): a full-body keyframe
   constraint on frame 0 so consecutive clips continue without a cut.
 - **Later phases:** ARDY-Core streaming (prompt changes mid-motion), a mixer with the

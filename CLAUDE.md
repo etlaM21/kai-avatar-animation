@@ -162,7 +162,8 @@ Manny AnimBP, IK Retargeter, `ABP_Face`) is reused untouched.
   Deliberately plain playback for now (see Procedural CLI); chaining deferred.
 - GUI front end (2026-10-09, `ae35a1d`): the Prompt tab in `mirroring\gui.py` drives the
   same pieces as the CLI (one generation thread, the cache, `LoopPlayer`) - see "gui.py".
-  Not yet run against the real Spark, camera and Unreal together (open item).
+  Run for real with the Spark and Unreal on 2026-10-13 (Prompt tab); the lane switch
+  with the camera is still open.
 - ARDY streaming, the mixer with the webcam lane, and ARDY-SOMA are later
   (`procedural-animation.md` §6).
 
@@ -721,11 +722,12 @@ What this answers for our open items:
   Measured on the GB10, 270 frames (9 s): 100 steps 5.8 s warm (7.3 s first request),
   50 steps 2.9 s, 25 steps 1.5 s, 10 steps 0.7 s; transfer of the ~890 KB NPZ 0.3-1.3 s
   (direct link, through the SSH tunnel); `/health` round trip 76 ms. Default steps set
-  to 33 (Malte, 2026-10-09; not yet timed on the GB10 - by the numbers above, ~2 s).
+  to 33 (Malte, 2026-10-09): 2.0-2.1 s on the GB10, link 0.8-1.6 s (2026-10-13, read
+  from the GUI).
   Next: the deferred playback layers.
-- **GUI Prompt tab: run it for real.** Built and checked offline (`gui_checks.py`, a
-  scripted run of the real window against the fake Kimodo server). Not yet run with the
-  camera, the real Spark and Unreal together. Check in Unreal: a lane switch in each
+- **GUI lane switch: check it for real.** The Prompt tab ran with the real Spark and
+  Unreal on 2026-10-13 (fresh and cached clips, queue, library, loop, stay in place).
+  Not yet run together with the camera. Check in Unreal: a lane switch in each
   direction with a clip playing; what Manny/the MetaHuman do on the present=0 handoff
   (the plugin's `present` handling is not visible from here); a switch while a
   generation is in flight.
@@ -737,6 +739,16 @@ What this answers for our open items:
   MetaHuman does there. Procedural test 4 decodes with the same linear model, so it
   passes regardless. Needs a `ue_head_probe.py` stage at 90/135/180° before deciding
   (cap the yaw, keep heading near the camera, or rely on Unreal if it is linear).
+  2026-10-13, by eye: a head at ~85° and a full turn through ±180° looked right in
+  Unreal, no flip at the wrap - so likely linear.
+- **Generated-motion head: the pipeline is exact, the look is Kimodo's (2026-10-13).**
+  A recorded run showed chin-up standing, an upright face while hunched, a look back in
+  a turn and a collar fold. Measured: the face channel's head pitch equals Kimodo's own
+  (from `posed_joints`, independent of the retarget) within 0.1-0.5°; the T-pose
+  reference is level (median +5.5° over 133 clips); the camera stood at chest height.
+  The collar fold is the MetaHuman neck seam (Not started). Proposed fixes A-D
+  (regression check, eye-height camera, optional head-pitch limit layer, neck-seam
+  probe) are in `mirroring\README.md` §10, awaiting Malte.
 - **Playback layers deferred from v1:** re-centring + heading alignment (the face-channel
   `head_rotation` must be rotated by the same yaw, or the head disagrees with the body),
   per-bone crossfade, idle loop, stage box.

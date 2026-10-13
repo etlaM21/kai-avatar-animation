@@ -89,9 +89,13 @@ rm -rf ~/project_kaspar/modules/kai-avatar-animation/pipeline-network-osc
 
 ## 3. Run the GUI for real (Windows + Spark + Unreal)
 
-Built and checked offline only (tests + a scripted run against the fake Kimodo server).
+**Prompt tab done 2026-10-13** (recording `261013_Kai_Kimodo_v2.mp4`): real Spark,
+tunnel and Unreal, no calibration before playback. The Spark dot green, fresh and cached
+clips, queue, history, library, loop and stay in place all worked and drove the
+MetaHuman. 33 steps timed (README §9.12). What it showed about the head: step 7.
+Still open below: everything that involves the **Tracking tab** and the lane switch.
 
-- [ ] Unreal open with the MetaHuman level; service running on the Spark (step 2).
+- [x] Unreal open with the MetaHuman level; service running on the Spark (step 2).
 - [ ] Tunnel, in its own PowerShell window, left open (prints nothing after the
   password; that is the working state):
 
@@ -114,12 +118,14 @@ cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation\mirroring
     else? Write it into CLAUDE.md (gui.py section); it decides whether the handoff
     should send the bind pose instead.
   - Prompt → a clip plays; the Spark dot is green; a generation time is shown.
+    **Done 2026-10-13.**
   - Switch back to **Tracking** while a clip plays AND a prompt is still generating:
     the webcam resumes, the clip stops, and the prompt shows up in History as
     "not played - cached".
-  - **Stay in place** on a walking prompt; **loop off** after the last clip.
-- [ ] Note the generation time at **33 steps** (the new default) from the queue or
-  history, and put it into the table in `mirroring\README.md` §9.12 ("not timed yet").
+  - **Stay in place** on a walking prompt (done 2026-10-13); **loop off** after the
+    last clip.
+- [x] Generation time at **33 steps**: 2.0–2.1 s on the GPU + 0.8–1.6 s link
+  (2026-10-13, read from the GUI), now in `mirroring\README.md` §9.12.
 
 ## 4. Windows cleanup
 
@@ -193,3 +199,43 @@ Nothing is implemented. Pick what Claude should design (design first, then code)
 ```powershell
 curl.exe -s -o NUL -w "%{http_code} %{time_total}s\n" http://100.83.6.8:8765/
 ```
+
+## 7. Generated-motion head and neck (from the 2026-10-13 run)
+
+What the recording looked like: chin up while standing (jumping jacks, high five), the
+face upright while the torso hunched (break dancing), the head looking back during the
+sprint's turn, a fold in the collar at the neck. What was measured (offline, on the cached
+clips that played, through the real adapter, retarget and `head_rotation_to_curves`,
+against Kimodo's own head pitch taken from joint positions only):
+
+- The face channel's head pitch equals Kimodo's within 0.1–0.5° while the body faces the
+  camera. The chin-up (+19…+26° in "three jumping jacks", +8° in "high fiving") is in
+  Kimodo's motion. Not the T-pose reference: quiet standing over 133 clips has a median
+  head pitch of +5.5° per clip.
+- The upright face while hunched is the head following the torso (head −13°, torso lean
+  +14°). The look back in the turn is Kimodo's too (head −80° against the chest).
+- The Unreal camera sits about at chest height (the horizon crosses the character's
+  chest), so it looks up under the chin: a level head already reads as chin-up.
+- Head yaw at ~85° (sprint) and through ±180° (circle run) looked right in Unreal, no
+  flip at the wrap - by eye only.
+- What is left: the collar fold, the MetaHuman Body/Face neck seam (README §10).
+
+Proposed fixes, details in `mirroring\README.md` §10. None implemented:
+
+- [ ] **B - judge from eye height** (no code). Put the Unreal camera at the MetaHuman's
+  eye height, then replay the clip (close the GUI first: same ports):
+
+```powershell
+cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation
+.\venv\Scripts\python.exe -m procedural_animation.procedural_conductor --clip remote_kimodo_service\cache\a-person-doing-three-jumping-jacks__s166259168__270f__33st__bad767940d7c.npz --loop
+```
+
+- [ ] **A - regression check**: approve adding "sent head pitch = Kimodo's
+  position-derived head pitch" to `procedural_checks.py` (Claude writes it).
+- [ ] **C - head-pitch limit layer**: after B, decide whether you want it at all (off by
+  default, like stay in place).
+- [ ] **D - neck seam probe**: approve a `ue_head_probe.py` stage that replays a generated
+  clip and reads the Body and Face `neck_01`/`neck_02`/`head` back (Unreal open, Python
+  remote execution on). Decide on the seam once it has numbers.
+- [ ] The head yaw stage at 90/135/180° (CLAUDE.md open item): the run suggests Unreal
+  stays linear; the probe turns that into a number.

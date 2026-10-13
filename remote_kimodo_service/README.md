@@ -11,8 +11,8 @@ short operator's guide; every stage is explained in detail in
 
 | Measured on the GB10, 9 s clip | |
 |---|---|
-| generation, 100 / 50 / 25 / 10 steps | 5.8 s (7.3 s first request) / 2.9 s / 1.5 s / 0.7 s |
-| transfer of the ~890 KB NPZ, through the tunnel | 0.3–1.3 s |
+| generation, 100 / 50 / 33 / 25 / 10 steps | 5.8 s (7.3 s first request) / 2.9 s / 2.0–2.1 s / 1.5 s / 0.7 s |
+| transfer of the ~890 KB NPZ, through the tunnel | 0.3–1.6 s |
 | cache hit (no network) | ~0.07 s |
 
 ```
