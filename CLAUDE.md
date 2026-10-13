@@ -22,6 +22,7 @@ The documents, and what each one is for:
 | `remote_kimodo_service\README.md` | Operator's guide: start the service, the tunnel, play |
 | `_old\README.md` | What was archived on 2026-10-09, and what replaced each piece |
 | `TODO.md` | Malte's open steps, with the exact commands to run |
+| `REA_FINDINGS.md` | Reverse-engineering notes on Dollars MONO's solver (2026-10-11); distilled in "Lessons from Dollars MONO" |
 | this file | The working guide: how to run things, what is load-bearing, what must not be re-broken, what is open |
 
 ## Working agreement
@@ -655,6 +656,61 @@ generation worker, the health poller, and a short-lived thread for every switch,
 and restart (anything that joins) report through one event queue drained via
 `root.after`. Errors are one line in the tab, never a traceback.
 
+## Lessons from Dollars MONO (reverse-engineered 2026-10-11)
+
+Source: `REA_FINDINGS.md` (module root). Read its CONSOLIDATED SUMMARY and S1-S9; where
+its chronological log disagrees with them, the summary wins. Nothing was copied: the
+notes describe algorithms in our own words. Labels there: confirmed (code, scene data or
+packets) vs inferred. **None of this is implemented.** Each item below is a proposal
+for Malte to approve first ("Architecture first"), and any `pose_solver.py` change must
+keep `solver_checks.py` passing and be measured against the recordings before and after.
+
+What it is: a Unity app using MediaPipe-family landmarks (plus an encrypted network of its own),
+solving onto a humanoid avatar with **the same 52-bone Manny list and bind rotations as
+ours**, sending JSON over UDP at **~20 Hz**. So its differences come from the solver,
+not from a better rig or detector. The encrypted model files were deliberately not opened.
+
+Confirmed numbers worth reusing:
+
+| Topic | Dollars | Ours now |
+|---|---|---|
+| Landmark filter | One Euro per coordinate, minCutoff 0.25 Hz, beta 4.5/9/18/38/55 (sensitivity 1-5), dCutoff 30 | EMA on bones (`PoseSmoother`), no landmark filter |
+| Rotation smoothing | `SmoothDamp` per quaternion component, 0.05 s, renormalised | EMA/NLERP alpha |
+| Leg gate | left/right segment-length ratio (shorter/longer): hold < 0.6, trust again ≥ 0.8 for 2 updates; plus a frame-to-frame jump test (0.55/0.65 × leg length) | visibility/presence < 0.5 hold, > 0.65 resume |
+| Leg recovery | whole chain (thigh+calf+foot) together, **smoothstep** `(3-2t)t²` over 6 pose updates (~0.3 s) | per bone, linear over `HOLD_BLEND_FRAMES` = 8 render frames |
+| Other regions | continuous weight `clamp((vis-0.4)/0.3, 0, 1)` per landmark pair (nose, wrists, hips 23/24, ankles 27/28); blend **toward a base/idle pose**, not a freeze; `t = max(angleWeight, visWeight)`, `angleWeight = clamp(largest Euler angle / 20°, 0, 1)`; 0.25 s hold then 0.25 s fade | hard hold-and-freeze |
+| Spine | not rigid: bend splits ~0.26 / 0.61 / 0.13 over spine_01/02/04, pelvis carries extra lean (packets; mechanism unknown) | one rigid `body_rot` for pelvis + spine |
+| Neck/head | neck takes ~0.38 of **pitch** (0.29-0.49), ~0 of **yaw** (≤ 2.7° while the head turns -73..+56°); neck counter-rotates the spine (corr -0.955), keeping the head level | `NECK_SHARE` 0.4 on all three axes |
+| Root translation | pelvis position only (cm), Y = real camera distance; `delta = (hip - initial) × hipWeight`, SmoothDamp 0.03 s / max speed 15, optional snap; hips lost → **glides back to rest**, never freezes; off in upper-body mode | none (hip-centred world landmarks) |
+| Camera level | one-shot pitch estimate from the body axis, then **all** landmarks rotated by it | `torso_lean_offset_deg`, torso only |
+
+What this answers for our open items:
+
+- **Root translation** is no longer a blank: the output shape, gain, smoothing and
+  fallback are known (S6/S9). The *depth source* stays unknown (inside their encrypted
+  network plus a camera-intrinsics graph), so our method still has to be chosen: image-space
+  hips/ankles + camera intrinsics/floor plane. Still an architecture decision.
+  On our side it would ride in the existing packet: the encoder already sends a position
+  per bone; whether the plugin applies the pelvis position is to be checked in
+  `K:\KaiTracking\Plugins\MediaPipeLiveLink` before designing anything.
+- **Wobbly head:** strongest candidate is the missing landmark filter. Try a One Euro on
+  the face-mesh points that build the head basis (offline on recordings, measure jitter
+  and lag before/after), before touching `NECK_SHARE`.
+- **Ear/nose fallback head:** their pattern fits it: weight by nose visibility,
+  overridden by the 20° angle weight so a clearly turned/bent head is still followed.
+  Head *target* source in Dollars is unknown, so this does not decide face-mesh vs ears.
+- **Spine lean / head sinking:** S1-S3 (curved spine, pitch-only neck share, neck
+  counter-rotation). Would change asserted solver checks only if bind/rest change; they
+  should not.
+- **Procedural lane, deferred playback layers:** their recovery (smoothstep over ~0.3 s,
+  whole chain, shortest-path slerp) is a field-proven shape for our planned ~0.3 s
+  per-bone crossfade; use smoothstep, not linear. Their "blend toward a base animation,
+  root glides to rest" is the same idea as our idle loop.
+- **present=0 handoff (GUI):** Dollars sends `present=0` only during warm-up, never
+  during movement; on loss it blends to a base pose instead. Useful context for the
+  open handoff question, not an answer to what our plugin does with present=0.
+- Still unknown there too: knees converging (not studied), what `enhanced`/`multi` do.
+
 ## Open items
 
 ### Next up
@@ -691,7 +747,13 @@ and restart (anything that joins) report through one event queue drained via
   measured, not guessed.
 - **Head is still a bit wobbly live.** The conversion is exact, so the jitter comes
   from the face-mesh basis frame to frame and/or smoothing. Measure on a recording
-  before tuning.
+  before tuning. First candidate: a One Euro landmark filter (Dollars' parameters,
+  see "Lessons from Dollars MONO").
+- **Solver proposals from the Dollars analysis (await approval):** One Euro landmark
+  filter; leg length-ratio gate + whole-chain smoothstep recovery; pitch-only neck
+  share with spine counter-rotation; curved spine; continuous visibility weights blending
+  to rest with the 20° angle override. Each needs a before/after measurement on
+  `recordings\`, and the leg gate needs a leg-out recording (`TODO.md`).
 
 ### For you (Malte)
 
@@ -721,7 +783,9 @@ and remove what is done.
 - **Root translation (live lane).** MediaPipe world landmarks are hip-centred, so the
   live character can never step, shift or jump. Needs image-space landmarks or a
   separate position estimate. An architecture decision, not a tune. The procedural
-  lane already provides real root motion.
+  lane already provides real root motion. Dollars shows the target shape (pelvis
+  position only, gain = hip visibility weight, light smoothing, glide to rest on loss);
+  its depth method stays unknown. See "Lessons from Dollars MONO".
 - **Face crop experiment.** Reinstate `head_pose_capture.py` on a crop around the
   pose-derived head. Only if the landmark-derived basis proves fragile.
 - **Knees converge.** The character's stance is narrower than the performer's (~0.65

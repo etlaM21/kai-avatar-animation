@@ -155,14 +155,36 @@ cd mirroring
 - [ ] **Test the solver in UE** if not already done: calibrate upright once, then turn
   and nod, rotate the wrists palm-up/down, spread and curl the fingers, crouch, lean out
   of frame. Confirm the state of branch `feature/solver-fixes` (merged or not).
-- [ ] **Record an occlusion clip** if the gating thresholds should be tuned harder (lean
-  over the desk until the legs leave frame, step half out of shot, one arm behind the
-  back):
+- [ ] **Record an occlusion clip** (now also needed to test the Dollars leg gate, see 6).
+  Lean over the desk until the legs leave frame, step half out of shot, one arm behind
+  the back, walk up to the camera so the legs leave frame:
 
 ```powershell
 cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation\mirroring
 ..\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\occlusion.npz
 ```
+
+## 6. Decide on the Dollars MONO findings
+
+Summary in CLAUDE.md, "Lessons from Dollars MONO"; details in `REA_FINDINGS.md` (S1-S9).
+Nothing is implemented. Pick what Claude should design (design first, then code):
+
+- [ ] **One Euro landmark filter** (first candidate for the wobbly head; lowest risk).
+- [ ] **Neck: pitch-only share, ~0 yaw**, plus neck counter-rotation against the spine.
+- [ ] **Curved spine** (~0.26 / 0.61 / 0.13 over spine_01/02/04) instead of the rigid torso.
+- [ ] **Leg gate by left/right length ratio** (0.6 / 0.8, 2 updates) with whole-leg
+  smoothstep recovery. Needs the occlusion recording above.
+- [ ] **Continuous visibility weights, blend to rest** (with the 20° angle override)
+  instead of freezing.
+- [ ] **Root translation** (architecture decision). Before it: say whether the
+  MediaPipeLiveLink plugin applies the pelvis position it already receives
+  (`K:\KaiTracking\Plugins\MediaPipeLiveLink`).
+- [ ] Procedural crossfade (when it is built): smoothstep over ~0.3 s, not linear.
+- [ ] Optional, to settle the leg-recovery question for good: run Dollars again with
+  the UDP listener while stepping a leg out of frame (REA_FINDINGS O7).
+- [ ] `dollars_capture.jsonl` (packets from a third-party app) is committed in the
+  module root (`7c8c558`). Decide whether it belongs in the repo; if not:
+  `git rm --cached dollars_capture.jsonl` and add it to `.gitignore`.
 
 - [ ] **Request Llama-3-8B-Instruct access on Hugging Face** before the ARDY phase.
 - [ ] Optional: **the direct-port check** (only if you want to drop the SSH tunnel). On
