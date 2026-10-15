@@ -218,6 +218,8 @@ against Kimodo's own head pitch taken from joint positions only):
 - Head yaw at ~85° (sprint) and through ±180° (circle run) looked right in Unreal, no
   flip at the wrap - by eye only.
 - What is left: the collar fold, the MetaHuman Body/Face neck seam (README §10).
+  **2026-10-15:** that run had the actor on Use Live Link, which gives the MetaHuman
+  Manny's neck lengths - very likely the collar fold. Re-judge first (§9).
 
 Proposed fixes, details in `mirroring\README.md` §10. None implemented:
 
@@ -311,3 +313,44 @@ FOV against the tape-grid recording before trusting it. Worth comparing at the s
 (not checked here): newer single-image calibration models such as GeoCalib (ECCV 2024),
 which also estimate the camera's pitch and roll - the pitch would feed the deferred
 camera levelling as well.
+
+## 9. MetaHuman setup in Unreal (the "sinking head", solved 2026-10-15)
+
+**Status:** solved for Play mode. The head sank because the actor's *Use Live Link*
+swaps the Body to Epic's `ABP_MH_LiveLink`, which gives the MetaHuman Manny's bone
+lengths. Working setup: Use Live Link off, Use ARKit off, subject None; Body on our
+`MH_LiveLink_Retarget-Manny` (retarget + the face nodes Malte added); watch it in
+**Play (PIE)**. Why, with numbers: `mirroring\README.md` §6, CLAUDE.md "MetaHuman setup".
+
+- [ ] **Make the editor viewport work without Play** (the flags reset on every
+  construction-script re-run). In `BP_NewMetaHumanCharacter` › Construction Script, after
+  the Live Link branch, on *both* paths: *Set Update Animation In Editor* (true) for
+  `MannySource`, `Body`, `Face` and `SkeletalMesh`. Until then, the quick fix: paste this
+  into Unreal's Output Log with the console set to **Python** (or ask Claude to run it
+  over remote execution). It holds until the actor is moved or changed:
+
+```python
+import unreal
+for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+    if a.get_class().get_name() == "BP_NewMetaHumanCharacter_C":
+        for c in a.get_components_by_class(unreal.SkeletalMeshComponent):
+            c.set_update_animation_in_editor(True)
+```
+
+- [ ] **Re-check the head turn on the working setup** (the old numbers were measured with
+  Use Live Link on). Close the GUI, Unreal in the editor viewport with the flags set:
+
+```powershell
+cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation\mirroring
+..\venv\Scripts\python.exe tests\ue_head_probe.py --measure
+..\venv\Scripts\python.exe tests\ue_head_probe.py --inspect
+```
+
+  Expected: the curves still turn `neck_02`/`head` absolute at 50°/unit; `--inspect`
+  shows every Body bone at ratio 1.000.
+- [ ] **Re-judge the collar fold and the neck seam** (§7 D) on the working setup - both
+  were seen with Use Live Link on, so they may be gone.
+- [ ] **Commit** the probe's new `--inspect` mode (`mirroring\tests\ue_head_probe.py`) and
+  these doc updates (`README.md`, `CLAUDE.md`, `TODO.md`, `mirroring\README.md`).
+- [ ] Optional: delete the extra actor copies in the level once the original works, so
+  only one MetaHuman listens.

@@ -2,7 +2,10 @@
 
 **Project:** project_kaspar
 
-**Status (2026-10-07):** both lanes work end to end.
+**Status (2026-10-15):** both lanes work end to end; the live lane now has root
+translation (the character follows you around the room). On the MetaHuman, run
+Unreal in **Play (PIE)** with the actor's *Use Live Link* off - see §6 for why, and
+for the "sinking head" it fixes.
 
 - **Live capture** (§2–8): one webcam drives face (ARKit blendshapes + head
   rotation), full body pose, and finger tracking on Unreal Engine 5.8's "Manny"
@@ -152,6 +155,13 @@ remote execution (Project Settings → Python → Enable Remote Execution) and
 prints them against the rest stage, so questions about what Unreal does with a
 signal are answered with numbers rather than by eye. Stop `conductor.py` first -
 both send to the same ports.
+
+`--inspect` (2026-10-15) reports, for every MetaHuman in the level, each skeletal
+mesh component's AnimBP, mesh, scale and leader pose, and each neck/shoulder bone's
+current **length against that mesh's own reference length**, plus the head's height
+above the shoulders and the Body/Face joint distance. A ratio far from 1.00 means
+something overwrites bone translations (§6.3). `--inspect --no-stream` sends nothing
+and inspects whatever is driving the character right now. Reads only.
 
 Or drive both lanes from a GUI instead of the terminal (from `mirroring\`):
 
@@ -345,18 +355,85 @@ originally sketched here:
 
 ## 6. Downstream: Manny → MetaHuman
 
-Live Link Pose drives Manny 1:1 (no retargeting). In the `KaiTracking` UE
-project, `BP_NewMetaHumanCharacter` carries three skeletal mesh components,
-as seen from the editor during this session's measurements:
+Live Link Pose drives Manny 1:1 (no retargeting); Manny is retargeted onto the
+MetaHuman. Rewritten 2026-10-15 after the "sinking head" investigation: everything
+below was read out of the running editor (remote execution, nothing edited) and
+measured with `tests/ue_head_probe.py --inspect`.
 
-- `MannySource` - `SKM_Manny_Simple` on the Live Link AnimBP, the retarget
-  source.
-- `Body` - the MetaHuman body on `ABP_MH_LiveLink`, following Manny (a 45°
-  torso turn on Manny lands as exactly 45° on the MetaHuman pelvis and spine).
-- `Face` - the MetaHuman face on `ABP_Face`, which copies the Body's pose and
-  takes its blendshapes **and head rotation** from Live Link Face.
+### 6.1 The working setup
 
-**Who owns the head.** On the MetaHuman the visible head is the Face
+In the `KaiTracking` project, `BP_NewMetaHumanCharacter`
+(`/Game/MetaHumans/NewMetaHumanCharacter/`) carries these skeletal mesh components.
+The AnimBPs are the Blueprint's **component defaults**, and they are the right ones:
+
+| Component | AnimBP | What it does |
+|---|---|---|
+| `MannySource` (hidden) | `SKM_Manny_Simple_LiveLink` | Live Link Pose, subject `MediaPipePose`, onto Manny 1:1 |
+| `Body` | **`MH_LiveLink_Retarget-Manny`** (`/Game/`, K.ai's own) | retargets `MannySource` onto the MetaHuman with Epic's `RTG_MH_IKRig` (MetaHumanCharacter plugin) - the MetaHuman keeps **its own bone lengths**. Also holds the **face**: a Live Link Pose node with subject `PythonConductor_Face` (curves only) and *Evaluate Pose Asset* `PA_MetaHuman_ARKit_Mapping` (ARKit's 52 curves → the MetaHuman's `CTRL_expressions_*` controls). References `CR_Distortion` too |
+| `Face` | `ABP_Face` (Epic's) | copies the Body's pose and curves (so the expressions arrive from the Body); the mesh's own post-process `ABP_Face_PostProcess` runs RigLogic |
+| `SkeletalMesh` (outfit) | none | leader pose = `Body` |
+
+Actor settings: **Use Live Link off, Use ARKit off, Live Link Subject = None.** Then
+watch it in **Play (PIE)**: body and face tracked, no distortion. Verified by Malte on
+2026-10-15. Measured on that setup: every Body bone at the MetaHuman's own length
+(ratio 1.000, e.g. `neck_01` 17.68 cm, `clavicle` 11.99 cm), 176 face curves on the
+Body and 190 on the Face.
+
+### 6.2 Why only in Play: "Update Animation in Editor"
+
+In the level **editor viewport** (not Play), a skeletal mesh only animates if its
+*Update Animation in Editor* flag is on. The Blueprint preview window and Play always
+animate - which is why both always looked right. The flag is off by default, and the
+MetaHuman Blueprint's construction script sets it from **Use Live Link**: ticking it in
+Details re-runs the construction script, which resets it straight away (the "it
+updates once" effect). So in the editor viewport you only see motion with Use Live
+Link on - and Use Live Link brings the problem in §6.3.
+
+Workarounds, until it is fixed in the Blueprint:
+
+- **Play (PIE)** - works always. Use it for performances.
+- Set the flag without a construction-script re-run, from Python (remote execution):
+  `component.set_update_animation_in_editor(True)` on `MannySource`, `Body`, `Face`
+  and `SkeletalMesh`. Holds until the next re-run (moving the actor, changing any of its
+  properties, reloading the level).
+- Permanent (open, `TODO.md` §9): in `BP_NewMetaHumanCharacter`'s construction script,
+  set *Update Animation In Editor* = true for those four components after the Live
+  Link branch, on both paths.
+
+### 6.3 Why "Use Live Link" sinks the head
+
+With Use Live Link on, the construction script **replaces the Body's AnimBP** (and,
+with an empty subject, the Face's too) with Epic's `ABP_MH_LiveLink`. That AnimBP is
+made for a Live Link subject that already *is* a MetaHuman skeleton (body + ARKit face
+in one subject): it applies the subject's bones **by name, translations included**, and
+it is the Blueprint's only built-in route for ARKit face curves. Fed our Manny-skeleton
+subject, the MetaHuman gets **Manny's bone lengths** - no retarget happens at all:
+
+| Bone | MetaHuman's own | With Use Live Link (= Manny's) |
+|---|---|---|
+| `neck_01` (from `spine_05`) | 17.68 cm | 11.89 cm - neck base 5.8 cm too low |
+| `clavicle_l/r` (from `spine_05`) | 11.99 cm | 5.85 cm - shoulders 6.1 cm pulled in |
+| `spine_05` | 13.48 cm | 19.44 cm |
+| pelvis height | 91.52 cm | 95.93 cm |
+
+The mesh is skinned for its own proportions, so the neck and shoulder skin bunches up
+around the head: the "football player in full gear" look. It showed on webcam and
+Kimodo motion alike, with the face receiver off, and never in the Blueprint preview -
+all because it is a property of the placed actor, not of the motion. Choosing
+`PythonConductor_Face` as the actor's subject makes it worse: the subject goes to the
+**Body** only, whose `ABP_MH_LiveLink` then evaluates the face subject as its pose
+source. (Editing `ABP_MH_LiveLink` itself is no fix: it is Epic's shared asset, and the
+wrong component.)
+
+How it was found, for next time (all in `tests/ue_head_probe.py`, CLAUDE.md
+"MetaHuman setup"): `--inspect` compares each bone's current length with the mesh's own
+reference length (rotations never change a length, only overwritten translations do);
+reading the component **defaults** against the placed actors showed the swap; the
+asset registry showed that only `ABP_MH_LiveLink` and our `MH_LiveLink_Retarget-Manny`
+reference `PA_MetaHuman_ARKit_Mapping`. The older `--measure` reads rotations only,
+which is why a sunk head passed it.
+
+### 6.4 Who owns the head On the MetaHuman the visible head is the Face
 component, and the Body stream's head rotation never reaches it - measured:
 with the head turned 30° on Manny and the face curves at zero, the MetaHuman's
 `neck_02`/`head` stay at 0.0°. Head rotation is therefore sent over the Live
@@ -365,6 +442,15 @@ body stream keeps sending its own head for Manny-only and non-MetaHuman
 targets. The alternative - changing `ABP_Face`'s layered-blend branch root so
 the Body's head passes through - works too, but is a per-user edit to an Epic
 asset (see CLAUDE.md).
+
+**To re-verify on the §6.1 setup** (`TODO.md` §9): the measurements in this subsection
+and in §2 (curves set `neck_02`/`head` absolute, 50°/unit) were taken before
+2026-10-15, with the actor on Use Live Link. On the current route the face curves
+reach the Face through the Body's AnimBP and `ABP_Face`'s copy; whether the head
+curves behave the same there needs one `ue_head_probe.py --measure` run (in the
+editor viewport with the flags of §6.2 set).
+
+### 6.5 Retarget solver
 
 Still open: the retarget's solver choice is a live-performance tradeoff -
 **Full Body IK** gives the best proportion correction but is the most
@@ -927,7 +1013,10 @@ Generated-motion lane:
   the chest). The Unreal camera stood at about chest height (the horizon crosses the
   character's chest), which shows a level head from under the chin. So the retarget and
   the face channel are exact; the look is Kimodo's motion plus the camera; the collar
-  fold is the neck seam listed under the live lane below.
+  fold is the neck seam listed under the live lane below. **Update 2026-10-15:** that
+  run had the actor on Use Live Link, which gives the MetaHuman Manny's neck and
+  shoulder lengths (§6.3) - very likely the collar fold. Judge it again on the §6.1
+  setup before D below.
 
   Proposed, none implemented (awaiting Malte):
   - **A. No change to the retarget or the face channel.** Add the measurement as a check
@@ -971,14 +1060,16 @@ Live lane:
   lean along the camera's forward axis, so calibrating while turned
   under-counts Manny's 5.8° rest lean (0.35° at 20°, 1.7° at 45°). Calibrate
   square to the camera until this is fixed.
-- **MetaHuman-side effects of the head curves** (measured, not ours): the
+- **MetaHuman-side effects of the head curves** (measured, not ours, before
+  2026-10-15 on the Use Live Link setup - re-measure on §6.1): the
   Body mesh's `neck_01` also reacts to them (up to 13° for a 50° pitch) while
   the Face mesh's `neck_01` barely moves (~2°), a possible seam at the neck;
   and the pelvis/spine shift by up to 1.6°.
-- **Root translation.** MediaPipe world landmarks are hip-centred, so the
-  character can never step, shift or jump. Needs image-space landmarks or a
-  separate position estimate - an architecture decision, not a tune. (The
-  generated-motion lane already has real root motion, §9.9.)
+- **Make the editor viewport work without Play**: set *Update Animation in Editor*
+  in `BP_NewMetaHumanCharacter`'s construction script (§6.2).
+- **Root translation: v1 built 2026-10-15** (`pose_solver.py`, "root translation";
+  `cv2.solvePnP` of the world against the image landmarks). Open: glide back to the
+  centre when the hips are lost, jump mode, the real focal length (`TODO.md` §8).
 - **Distortion layer** - tracking artefacts as art-directable effects,
   downstream of a clean solver (see CLAUDE.md for the plan).
 - **Face crop experiment** - reinstate `head_pose_capture.py` on a crop around

@@ -16,7 +16,9 @@ The documents, and what each one is for:
 
 | File | What |
 |---|---|
-| `mirroring\README.md` | How both lanes work, in full detail (§2–8 live lane, §9 generated-motion lane) |
+| `README.md` | The overview for a newcomer: what this is, how to run it, the Unreal setup that works (Play mode), what was found out |
+| `mirroring\README.md` | How both lanes work, in full detail (§2–8 live lane, §6 the MetaHuman setup, §9 generated-motion lane) |
+| `UnityMediaPipePose_Findings.md` | How another project gets root translation from MediaPipe (PnP), measured on our recordings (§7); the basis of the root translation |
 | `docs\procedural-animation.md` | Research and plan for generated motion (Kimodo vs ARDY, retarget math, phases) |
 | `docs\remote-kimodo-streaming.md` | Network analysis for reaching the Spark |
 | `remote_kimodo_service\README.md` | Operator's guide: start the service, the tunnel, play |
@@ -82,7 +84,7 @@ needs torch/CUDA runs on the Spark, in its own venv (`remote_kimodo_service\requ
 ### Repo layout
 
 ```
-CLAUDE.md, requirements*.txt, venv\ (untracked)
+README.md, CLAUDE.md, TODO.md, *_FINDINGS/_Findings.md, requirements*.txt, venv\ (untracked)
 mirroring\              live lane + gui.py; flat modules that import each other by name
   ├─ tests\             solver_checks.py, gui_checks.py, ue_head_probe.py
   ├─ recordings\        raw landmark captures (+ trims.json)
@@ -333,11 +335,52 @@ for both. As built:
   the cache file); `fetch()` wraps it, so validate-before-cache exists once.
   `LoopPlayer.clear_pending()` takes queued clips back out, for the GUI's queue editing.
 
+## MetaHuman setup in Unreal — what works, and the "sinking head" (2026-10-15)
+
+Read before touching the MetaHuman actor or its AnimBPs. Everything here was read out
+of the running editor via remote execution (nothing edited) and measured with
+`tests/ue_head_probe.py --inspect`; full write-up in `mirroring\README.md` §6.
+
+**The working setup** = `BP_NewMetaHumanCharacter`'s own component defaults:
+`MannySource` on `SKM_Manny_Simple_LiveLink` (subject `MediaPipePose`); `Body` on
+**`MH_LiveLink_Retarget-Manny`** (`/Game/`, K.ai's own AnimBP: retarget via Epic's
+`RTG_MH_IKRig`, plus the face - Live Link Pose `PythonConductor_Face` → *Evaluate Pose
+Asset* `PA_MetaHuman_ARKit_Mapping`; also references `CR_Distortion`); `Face` on
+`ABP_Face` (copies the Body's pose and curves). Actor: **Use Live Link off, Use ARKit
+off, subject None**, and view it in **Play (PIE)**. Verified by Malte 2026-10-15.
+
+**Load-bearing facts:**
+
+- **Never turn on the actor's "Use Live Link".** The construction script then swaps the
+  Body (and with an empty subject the Face) to Epic's `ABP_MH_LiveLink`, which applies
+  a subject's bones by name, *translations included* - meant for subjects that already
+  are MetaHuman skeletons. With our Manny subject the MetaHuman gets Manny's bone
+  lengths: `neck_01` 11.89 instead of 17.68 cm, clavicles 5.85 instead of 11.99 cm -
+  the sinking head / "football gear" look, on both lanes. The subject field also feeds
+  the Body only, so picking `PythonConductor_Face` there breaks the body pose.
+- **The editor viewport (not Play) only animates meshes with *Update Animation in
+  Editor* on.** The construction script sets that flag from Use Live Link and resets
+  it on every re-run (a tick in Details re-runs it - "updates once"). The Blueprint
+  preview and Play always animate, which is why they always looked right. Workaround:
+  `set_update_animation_in_editor(True)` from Python on `MannySource`, `Body`, `Face`,
+  `SkeletalMesh` (holds until the next re-run). Permanent fix open (`TODO.md` §9).
+- `ABP_Face` has no Live Link of its own; only `ABP_MH_LiveLink` and our
+  `MH_LiveLink_Retarget-Manny` reference the ARKit mapping. Do not edit
+  `ABP_MH_LiveLink` (Epic's shared asset, used by every MetaHuman).
+- **Measure positions, not only rotations.** The earlier `--measure` read rotations
+  only, so a head that turned correctly but sat 6 cm too low passed. `--inspect`
+  compares bone lengths with the mesh's own reference (ratio 1.000 on the working
+  setup).
+- **Re-verify on this route** (`TODO.md` §9): the head-curve measurements below
+  (absolute, 50°/unit) and the neck-seam / collar-fold observations were all made with
+  Use Live Link on.
+
 ## Head rotation — who owns it, and why it is routed this way
 
 Resolved and verified end to end in UE 5.8 (turned and leaning torsos with turned
-heads land on target to 0.000°). Read before touching anything head-related in Python
-or in Unreal.
+heads land on target to 0.000°) - measured before 2026-10-15 with the actor on Use Live
+Link, so rotations only; re-verify on the working setup above. Read before touching
+anything head-related in Python or in Unreal.
 
 ### The Unreal finding
 
@@ -366,7 +409,8 @@ connected, bind pose (identity) when it is not.
 **Send head rotation through the Live Link Face channel**, which the MetaHuman already
 routes to the head, rather than rewiring Epic's asset.
 
-1. **Distribution.** K.ai users only add a Retarget Pose node to the Body AnimBP. No
+1. **Distribution.** K.ai users only edit the Body AnimBP (our
+   `MH_LiveLink_Retarget-Manny`: the retarget + the face Live Link nodes). No Epic
    MetaHuman asset gets edited, so nothing breaks when Epic restructures MetaHumans.
 2. It repairs the Live Link Face head channel, which was independently broken.
 3. Both head signals derive from the same basis, so they cannot disagree.
@@ -568,7 +612,8 @@ sends to 9001/11111:
 Current state: 26 checks, all pass.
 
 Then the Unreal check, stage by stage like `tests/ue_head_probe.py`: stream a handful
-of known poses and read the MetaHuman bones back.
+of known poses and read the MetaHuman bones back - rotations (`--measure`) **and**
+positions (`--inspect`, bone lengths vs the mesh's reference; see "MetaHuman setup").
 
 ### Current numbers (live lane, rest.npz / motion.npz)
 
@@ -743,9 +788,14 @@ What this answers for our open items:
   a turn and a collar fold. Measured: the face channel's head pitch equals Kimodo's own
   (from `posed_joints`, independent of the retarget) within 0.1-0.5°; the T-pose
   reference is level (median +5.5° over 133 clips); the camera stood at chest height.
-  The collar fold is the MetaHuman neck seam (Not started). Proposed fixes A-D
+  The collar fold was seen with the actor on Use Live Link (Manny's neck lengths, see
+  "MetaHuman setup") - likely that, re-judge on the working setup. Proposed fixes A-D
   (regression check, eye-height camera, optional head-pitch limit layer, neck-seam
   probe) are in `mirroring\README.md` §10, awaiting Malte.
+- **MetaHuman setup, follow-ups (2026-10-15, `TODO.md` §9):** make the editor
+  viewport work without Play (*Update Animation In Editor* in the construction
+  script); re-run `ue_head_probe.py --measure` on the working setup (head curves still
+  absolute, 50°/unit?); re-judge the collar fold and the neck seam there.
 - **Playback layers deferred from v1:** re-centring + heading alignment (the face-channel
   `head_rotation` must be rotated by the same yaw, or the head disagrees with the body),
   per-bone crossfade, idle loop, stage box.
@@ -814,6 +864,7 @@ and remove what is done.
 - **Lean calibration with a turned torso** (see Calibration).
 - **MetaHuman neck seam.** The head curves also move the Body mesh's `neck_01` (up to
   13° for a 50° pitch) while the Face mesh's barely moves. Possible visible seam.
+  Measured on the Use Live Link setup; re-measure on the working one first.
 - **Benchmark Full Body IK vs Body Mover + Limb IK** for the Manny → MetaHuman retarget.
 - **Cleanup, done 2026-10-09** (`_old\README.md`): the unused JSON protocol, the
   pose-only model, the stale `ue_plugin/` copy and the old Kimodo pipelines are archived.
