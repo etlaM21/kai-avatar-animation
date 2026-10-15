@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
+import opencv as cv
 from scipy.spatial.transform import Rotation as R
 import math
 import time
@@ -955,6 +956,7 @@ class PoseSolver:
     def solve(
         self,
         raw_world_landmarks: list[Any],
+        raw_image_landmarks: list[Any],
         face_landmarks: list[Any] | None = None,
         image_size: tuple[int, int] | None = None,
         left_hand_world_landmarks: list[Any] | None = None,
@@ -970,9 +972,29 @@ class PoseSolver:
         # Read off the head's global rather than recomposed from body_rot/_head_rel,
         # so the face channel is by construction the same head the body stream sends.
         self.head_rotation = global_rot[fi["head"]] * self.rest_global[fi["head"]].inv()
-        pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
+
+        # Calculating the pelvis translation using OpenCV's solvePnP function to get the pelvis position in 3D space based on the landmarks.
+        # Webcam resolution
+        w, h = image_size
+        # Focal length assumed in width pixels
+        fx, fy = w
+        # Optical center assumed to be at the center of the image
+        cx = w / 2
+        cy = h / 2
+        # Camera Matrix
+        default_camera_matrix = np.array([
+            [fx,  0, cx],
+            [ 0, fy, cy],
+            [ 0,  0,  1]
+        ], dtype=np.float32)
+        # Distortion coefficients assumed to be zero (no lens distortion)
+        default_dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+        pnp_success, rvec, tvec, _  = cv.solvePnP(raw_world_landmarks, raw_image_landmarks, default_camera_matrix, default_dist_coeffs)
+        pelvis_pos = hip_mid + np.array([tvec.x, tvec.z, self.pelvis_default_height_cm])
+        if pnp_success:
+            pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
         if self.ground_lock:
-            pelvis_pos = np.array([pelvis_pos[0], pelvis_pos[1],
+            pelvis_pos = np.array([pelvis_pos.x, pelvis_pos.y,
                                    self._ground_locked_pelvis_z(global_rot, pelvis_pos)])
 
         result: list[BoneTransform] = []

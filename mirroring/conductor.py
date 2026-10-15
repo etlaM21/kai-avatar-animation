@@ -393,7 +393,7 @@ class Conductor:
             # BODY bones, and their orientation now comes from the palm plane. Passing
             # the same landmarks to both keeps the wrist and the fingers consistent.
             raw_bones = self.pose_solver.solve(
-                frame.world_landmarks, face_lms, self.frame_size,
+                frame.world_landmarks, self._image_landmarks(frame), face_lms, self.frame_size,
                 hands_frame.left.world_landmarks if hands_frame.left.valid else None,
                 hands_frame.right.world_landmarks if hands_frame.right.valid else None,
             )
