@@ -182,9 +182,8 @@ Nothing is implemented. Pick what Claude should design (design first, then code)
   smoothstep recovery. Needs the occlusion recording above.
 - [ ] **Continuous visibility weights, blend to rest** (with the 20° angle override)
   instead of freezing.
-- [ ] **Root translation** (architecture decision). Before it: say whether the
-  MediaPipeLiveLink plugin applies the pelvis position it already receives
-  (`K:\KaiTracking\Plugins\MediaPipeLiveLink`).
+- [x] **Root translation** - built with PnP and verified live 2026-10-15 (the plugin does
+  apply the pelvis position). What is left: §8.
 - [ ] Procedural crossfade (when it is built): smoothstep over ~0.3 s, not linear.
 - [ ] Optional, to settle the leg-recovery question for good: run Dollars again with
   the UDP listener while stepping a leg out of frame (REA_FINDINGS O7).
@@ -239,3 +238,76 @@ cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation
   remote execution on). Decide on the seam once it has numbers.
 - [ ] The head yaw stage at 90/135/180° (CLAUDE.md open item): the run suggests Unreal
   stays linear; the probe turns that into a number.
+
+## 8. Root translation (live lane)
+
+**Status 2026-10-15: v1 works.** Built on `feat/root-translation` on top of `37ccf57`,
+run live with the camera and Unreal by Malte: the character follows you around the room.
+How it works: `pose_solver.py`, section "root translation" (CLAUDE.md, Open items).
+Offline checks 2g/2h in `solver_checks.py`, all pass.
+
+- [ ] **Publish the branch**: the code is committed (`1f3c6a6`); commit these doc updates,
+  then push and merge (as a PR on GitHub, or locally):
+
+```powershell
+cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation
+git add CLAUDE.md TODO.md
+git commit -m "docs: root translation status and open steps"
+git push -u origin feat/root-translation
+```
+
+- [ ] **Glide back to the centre when the hips are lost** instead of freezing (`TODO(root
+  glide)` in `pose_solver._root_offset_cm`; Dollars S5/S9: gain = hip visibility weight,
+  0.25 s hold + 0.25 s fade).
+- [ ] **Jump mode**: ground lock stays, PnP height only while airborne. Needs a recording
+  first (a few jumps on the spot, one step forward and back):
+
+```powershell
+cd K:\Kaspar_Project\project_kaspar\modules\kai-avatar-animation\mirroring
+..\venv\Scripts\python.exe conductor.py --debug --camera 1 --record recordings\root_jump.npz
+```
+
+- [ ] **Watch for the off-axis turn**: when you stand well to the side, does the character
+  look turned although you face the camera? (UnityMediaPipePose_Findings.md §7.7.) If so,
+  it needs a recording and a fix in the solver.
+- [ ] **One Euro filter** on the root, only if it looks jittery live (standing still it
+  wanders 0.2 cm sideways and 1.2 cm in depth on `rest.npz`).
+- [ ] **Real focal length** (the FOV field is a guess, 80° by default, and depth scales
+  directly with it). Pick one when depth matters:
+  - by eye: adjust the FOV in the GUI until walking a known distance looks right (works now);
+  - the webcam's spec-sheet FOV;
+  - a tape-grid recording: tape marks at 2.0 / 2.5 / 3.0 m straight ahead and ±0.75 m at
+    2.5 m, ~3 s standing on each, then arms up and a crouch
+    (`--record recordings\root_grid.npz`). Gives f, the lateral scale and the pose bias,
+    and is the ground truth for any other method;
+  - a checkerboard calibration (`cv2.calibrateCamera`), per camera and resolution mode;
+  - an ML estimate, below.
+
+### Option: MLFocalLengths (ML focal length from one image)
+
+[nandometzger/MLFocalLengths](https://github.com/nandometzger/MLFocalLengths) (MIT, 2023):
+an EfficientNet-B4 that predicts a photo's focal length from the picture alone, no EXIF.
+Trained on ~15k personal photographs with EXIF labels; outputs the **35 mm-equivalent**
+focal length; reported error **16 mm mean absolute** (35 mm-equivalent, on the author's own
+held-out photos). PyTorch, 233 MB weights downloaded on first run; input centre-cropped to
+256×256. Read from the README on 2026-10-15, not tried.
+
+How it would plug in: run it once per camera and resolution mode on a saved webcam frame,
+convert, type the FOV into the GUI. The 35 mm-equivalent value converts to pixels without
+any crop factor (35 mm equivalence is defined over the 43.27 mm diagonal):
+`f_px = f35 × image_diagonal_px / 43.27`, then `FOV_h = 2·atan(W / (2·f_px))`.
+
+| Pros | Cons |
+|---|---|
+| No checkerboard, no tape, no measuring: one frame of the room is enough | **Too inaccurate for depth on its own**: a webcam is around 25-30 mm equivalent, so 16 mm average error is ±50% or more on f - and depth scales 1:1 with f. The FOV guess we have is already in that range |
+| Runs locally and offline, MIT licence | Needs **PyTorch**, which the module venv must never get (CLAUDE.md): it would need its own small venv (or the Spark), run as a one-off tool, never inside the live lane |
+| Can average over many frames / several rooms to cut random error | Averaging does not remove a **bias**: trained on personal photos (camera lenses, EXIF), not on webcam frames (wide, low-res, often distorted, cropped differently per mode) - accuracy on webcams is unknown |
+| Per camera and resolution mode, automatically | The square centre crop throws away the sides of a 16:9 frame, the part that carries most of the wide-angle cue |
+| Quick to try (`python predict.py <folder>`) | Small project (46 stars, no releases); weights come from a Google Drive link |
+| | Validating it needs ground truth anyway (tape grid or checkerboard) - and with that in hand, the ML step is not needed |
+
+**Verdict:** fine as a cheap experiment, not as the source of truth. If tried, compare its
+FOV against the tape-grid recording before trusting it. Worth comparing at the same time
+(not checked here): newer single-image calibration models such as GeoCalib (ECCV 2024),
+which also estimate the camera's pitch and roll - the pitch would feed the deferred
+camera levelling as well.

@@ -683,18 +683,14 @@ Confirmed numbers worth reusing:
 | Other regions | continuous weight `clamp((vis-0.4)/0.3, 0, 1)` per landmark pair (nose, wrists, hips 23/24, ankles 27/28); blend **toward a base/idle pose**, not a freeze; `t = max(angleWeight, visWeight)`, `angleWeight = clamp(largest Euler angle / 20°, 0, 1)`; 0.25 s hold then 0.25 s fade | hard hold-and-freeze |
 | Spine | not rigid: bend splits ~0.26 / 0.61 / 0.13 over spine_01/02/04, pelvis carries extra lean (packets; mechanism unknown) | one rigid `body_rot` for pelvis + spine |
 | Neck/head | neck takes ~0.38 of **pitch** (0.29-0.49), ~0 of **yaw** (≤ 2.7° while the head turns -73..+56°); neck counter-rotates the spine (corr -0.955), keeping the head level | `NECK_SHARE` 0.4 on all three axes |
-| Root translation | pelvis position only (cm), Y = real camera distance; `delta = (hip - initial) × hipWeight`, SmoothDamp 0.03 s / max speed 15, optional snap; hips lost → **glides back to rest**, never freezes; off in upper-body mode | none (hip-centred world landmarks) |
+| Root translation | pelvis position only (cm), Y = real camera distance; `delta = (hip - initial) × hipWeight`, SmoothDamp 0.03 s / max speed 15, optional snap; hips lost → **glides back to rest**, never freezes; off in upper-body mode | PnP root (v1, 2026-10-15): X/Y from origin, step limit 20 cm/frame, hips lost → **frozen** (glide TODO), gain + FOV settings |
 | Camera level | one-shot pitch estimate from the body axis, then **all** landmarks rotated by it | `torso_lean_offset_deg`, torso only |
 
 What this answers for our open items:
 
-- **Root translation** is no longer a blank: the output shape, gain, smoothing and
-  fallback are known (S6/S9). The *depth source* stays unknown (inside their encrypted
-  network plus a camera-intrinsics graph), so our method still has to be chosen: image-space
-  hips/ankles + camera intrinsics/floor plane. Still an architecture decision.
-  On our side it would ride in the existing packet: the encoder already sends a position
-  per bone; whether the plugin applies the pelvis position is to be checked in
-  `K:\KaiTracking\Plugins\MediaPipeLiveLink` before designing anything.
+- **Root translation: built** (2026-10-15) with PnP instead of their unknown depth
+  source - see Open items. Still to take from Dollars: the hip-visibility gain and the
+  glide to rest on loss (S5/S9). The plugin applies the pelvis position (confirmed).
 - **Wobbly head:** strongest candidate is the missing landmark filter. Try a One Euro on
   the face-mesh points that build the head basis (offline on recordings, measure jitter
   and lag before/after), before touching `NECK_SHARE`.
@@ -793,8 +789,8 @@ and remove what is done.
   between `pose_solver` and the OSC encoder, off by default; driven live over a second
   OSC address space on the existing `UOSCServer`. Tag the current commit before fixing
   anything else; some artefacts are emergent and will not reproduce procedurally.
-- **Root translation (live lane): v1 built 2026-10-15, branch `feat/root-translation`,
-  not yet run live.** `cv2.solvePnP` (SQPNP) of the pose's world landmarks against its
+- **Root translation (live lane): v1 built and verified live 2026-10-15** (Malte: works
+  in Unreal; branch `feat/root-translation`). `cv2.solvePnP` (SQPNP) of the pose's world landmarks against its
   image landmarks (face + shoulders + hips, 0-12/23/24, confidence >= 0.5, >= 6 points),
   method and measurements in `UnityMediaPipePose_Findings.md` §7. In `pose_solver.py`
   ("root translation"); `solve()` / `update_calibration()` take an optional
@@ -808,8 +804,9 @@ and remove what is done.
   Measured on rest.npz: 0.22 cm sideways / 1.16 cm depth jitter (std).
   **Deferred:** glide to the origin when the hips are lost (TODO in the code, Dollars
   S5/S9); jump mode (needs `recordings\root_jump.npz`); One Euro filter; camera-pitch
-  levelling; absolute depth (FOV is a guess - a tape-grid recording would fix it);
-  watch for the off-axis turn (findings §7.7) once the character travels sideways.
+  levelling; absolute depth (FOV is a guess - a tape-grid recording would fix it, an
+  ML focal-length estimate is assessed in `TODO.md` §8); watch for the off-axis turn
+  (findings §7.7) once the character travels sideways. Open steps: `TODO.md` §8.
 - **Face crop experiment.** Reinstate `head_pose_capture.py` on a crop around the
   pose-derived head. Only if the landmark-derived basis proves fragile.
 - **Knees converge.** The character's stance is narrower than the performer's (~0.65
