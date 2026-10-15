@@ -204,6 +204,13 @@ class EditorReader:
             raise RuntimeError("no editor answered - is Python remote execution enabled?")
         self._r.open_command_connection(self._r.remote_nodes[0]["node_id"])
 
+    def inspect(self) -> list[dict]:
+        """--inspect: positions and setup of every MetaHuman's components."""
+        res = self._r.run_command(_INSPECT_QUERY, unattended=True, exec_mode=self._rex.MODE_EXEC_FILE)
+        if not res["success"]:
+            raise RuntimeError(res["result"])
+        return json.loads("".join(o["output"] for o in res["output"]).strip().splitlines()[-1])
+
     def read(self) -> dict:
         res = self._r.run_command(_QUERY, unattended=True, exec_mode=self._rex.MODE_EXEC_FILE)
         if not res["success"]:
@@ -229,6 +236,112 @@ class EditorReader:
 
     def close(self) -> None:
         self._r.stop()
+
+
+# ---------------------------------------------------------------------------
+# --inspect: why does the head sink? (2026-10-15)
+#
+# The MetaHuman's head sat too low ("football player in full gear") in the level,
+# but not in the Blueprint viewport and not on a fresh copy - it appeared as soon as
+# a Live Link subject was picked on the actor. Rotations alone cannot show that (the
+# old --measure only read rotations, which is why a sunk head passed it). This mode
+# reads POSITIONS: for every bone around the neck and shoulders, how long it is now
+# (distance to its parent joint) against how long it is in that mesh's own reference
+# pose. Rotations never change a bone's length; only something that overwrites the
+# bone TRANSLATIONS does - e.g. Manny's bone offsets from our packet landing directly
+# on the MetaHuman skeleton without the IK Retargeter. So a ratio far from 1.00 shows
+# where, and on which component, that happens.
+#
+# Run it twice and compare: once with the actor's Live Link subject at None, once
+# with the subject that makes the head sink.
+# ---------------------------------------------------------------------------
+
+INSPECT_BONES = ("pelvis", "spine_01", "spine_02", "spine_03", "spine_04", "spine_05",
+                 "neck_01", "neck_02", "head",
+                 "clavicle_l", "upperarm_l", "clavicle_r", "upperarm_r")
+_INSPECT_QUERY = """
+import unreal, json
+
+def safe(fn, default=None):
+    # Every read is optional: a property that does not exist on this engine version
+    # or component must not stop the whole report.
+    try:
+        return fn()
+    except Exception:
+        return default
+
+def name_of(obj):
+    return obj.get_name() if obj is not None else None
+
+out = []
+for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+    comps = {c.get_name(): c for c in a.get_components_by_class(unreal.SkeletalMeshComponent)}
+    if 'Body' not in comps or 'Face' not in comps:
+        continue  # not a MetaHuman
+    actor = {'actor': a.get_actor_label(), 'class': name_of(a.get_class()),
+             'scale': safe(lambda: list(a.get_actor_scale3d().to_tuple())), 'components': {}}
+    for cname, c in comps.items():
+        info = {
+            'anim_instance': safe(lambda: name_of(c.get_anim_instance().get_class())),
+            'anim_class': safe(lambda: name_of(c.get_editor_property('anim_class'))),
+            'mesh': safe(lambda: name_of(c.get_skinned_asset())) or safe(lambda: name_of(c.get_editor_property('skeletal_mesh'))),
+            'rel_scale': safe(lambda: list(c.get_relative_scale3d().to_tuple())),
+            'leader': safe(lambda: name_of(c.get_editor_property('leader_pose_component'))),
+            'bones': {},
+        }
+        for b in %s:
+            i = c.get_bone_index(b)
+            if i == -1:
+                continue
+            parent = safe(lambda: str(c.get_parent_bone(b)))
+            pos = c.get_socket_location(b)  # world space
+            entry = {'parent': parent, 'pos': [pos.x, pos.y, pos.z],
+                     # The bone's own offset from its parent in the mesh's REFERENCE
+                     # pose: its "real" length, whatever the animation does.
+                     'ref_len': safe(lambda: c.get_ref_pose_position(i).length())}
+            if parent and parent != 'None' and c.get_bone_index(parent) != -1:
+                pp = c.get_socket_location(parent)
+                entry['len'] = ((pos.x - pp.x) ** 2 + (pos.y - pp.y) ** 2 + (pos.z - pp.z) ** 2) ** 0.5
+            info['bones'][b] = entry
+        actor['components'][cname] = info
+    out.append(actor)
+print(json.dumps(out))
+""" % (repr(INSPECT_BONES),)
+
+
+def print_inspection(actors: list[dict]) -> None:
+    """One block per MetaHuman, one table per skeletal mesh component."""
+    if not actors:
+        print("  no actor with Body and Face components in the level (editor world, not PIE)")
+        return
+    for a in actors:
+        print(f"\n### {a['actor']}  ({a['class']}, actor scale {a['scale']})")
+        for cname, c in a["components"].items():
+            print(f"  [{cname}] mesh {c['mesh']}, anim {c['anim_instance'] or c['anim_class']}, "
+                  f"scale {c['rel_scale']}, leader pose {c['leader']}")
+            if not c["bones"]:
+                continue
+            print(f"    {'bone':12} {'parent':12} {'length now':>11} {'ref length':>11} {'ratio':>7}")
+            for b, e in c["bones"].items():
+                now, ref = e.get("len"), e.get("ref_len")
+                ratio = f"{now / ref:7.3f}" if now is not None and ref else "      -"
+                flag = "   <-- changed" if now is not None and ref and abs(now / ref - 1.0) > 0.02 else ""
+                print(f"    {b:12} {str(e['parent']):12} "
+                      f"{(f'{now:9.2f}cm' if now is not None else '-'):>11} "
+                      f"{(f'{ref:9.2f}cm' if ref else '-'):>11} {ratio}{flag}")
+            bones = c["bones"]
+            if all(k in bones for k in ("head", "upperarm_l", "upperarm_r")):
+                # The "sunk" number: how high the head joint sits above the shoulder
+                # joints (world Z). Compare it between components and between runs.
+                shoulders = (bones["upperarm_l"]["pos"][2] + bones["upperarm_r"]["pos"][2]) / 2.0
+                print(f"    head above shoulders: {bones['head']['pos'][2] - shoulders:+.2f} cm (world Z)")
+        body, face = a["components"].get("Body", {}).get("bones", {}), a["components"].get("Face", {}).get("bones", {})
+        shared = [b for b in ("neck_01", "neck_02", "head") if b in body and b in face]
+        for b in shared:
+            # Face copies the Body's pose; if their joints are not in the same place, the
+            # two meshes disagree at the neck - the seam.
+            d = np.linalg.norm(np.array(body[b]["pos"]) - np.array(face[b]["pos"]))
+            print(f"  Body vs Face {b}: {d:.2f} cm apart")
 
 
 def print_deltas(stage: dict, rest: dict) -> None:
@@ -259,10 +372,34 @@ def main() -> int:
     ap.add_argument("--measure", action="store_true",
                     help="read each stage's bone rotations back from the editor (needs Python remote "
                          "execution) and print them against 'rest', instead of timed viewing")
+    ap.add_argument("--inspect", action="store_true",
+                    help="stream the rest pose, then report every MetaHuman's components: anim class, "
+                         "scale, and neck/shoulder bone lengths against the mesh's own reference "
+                         "(needs Python remote execution) - the head-sinking check")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="with --inspect: send nothing, inspect whatever is driving the character now")
     ap.add_argument("--ue-root", default=r"C:\Program Files\Epic Games\UE_5.8")
     ap.add_argument("--ip", default="127.0.0.1")
     ap.add_argument("--rate", type=float, default=60.0)
     args = ap.parse_args()
+
+    if args.inspect:
+        reader = EditorReader(args.ue_root)
+        streamer = None
+        if not args.no_stream:
+            # The rig's own bind pose with neutral face curves: a known, still input.
+            streamer = Streamer(args.ip, args.rate)
+            streamer.bones, streamer.curves = build_body(stages()[0])[0], {}
+            streamer.start()
+            time.sleep(2.0)  # let the packets arrive and the AnimBPs settle
+        try:
+            print_inspection(reader.inspect())
+        finally:
+            if streamer is not None:
+                streamer.running = False
+                streamer.join()
+            reader.close()
+        return 0
 
     run = stages() if args.stage == "all" else [s for s in stages() if s.name == args.stage]
     if args.measure and run[0].name != "rest":
