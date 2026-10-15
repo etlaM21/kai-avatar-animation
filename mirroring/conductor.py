@@ -243,6 +243,7 @@ class Conductor:
         pose_smoothing_alpha: float = 0.5,
         show_debug: bool = False,
         record_path: str | None = None,
+        root_translation: bool = True,
     ) -> None:
         self.holistic_capture = holistic_capture
         # self.head_pose_capture = head_pose_capture  # disabled - see CLAUDE.md
@@ -302,7 +303,10 @@ class Conductor:
         self.pose_smoother = PoseSmoother(alpha=pose_smoothing_alpha)
 
         # --- pose channel: transform state + network target ---
-        self.pose_solver = PoseSolver(torso_lean_offset_deg=torso_lean_offset_deg)
+        # root_translation: whether the character walks when you walk (pose_solver,
+        # "root translation"). On unless --no-root-translation.
+        self.pose_solver = PoseSolver(torso_lean_offset_deg=torso_lean_offset_deg,
+                                      root_translation=root_translation)
         self.pose_encoder = LiveLinkPoseOSCEncoder(ip=pose_ip, port=pose_port)
         self._last_valid_bone_transforms: list[BoneTransform] = []
         # Kept so the 'c' key can calibrate the torso lean from the live frame.
@@ -393,9 +397,12 @@ class Conductor:
             # BODY bones, and their orientation now comes from the palm plane. Passing
             # the same landmarks to both keeps the wrist and the fingers consistent.
             raw_bones = self.pose_solver.solve(
-                frame.world_landmarks, self._image_landmarks(frame), face_lms, self.frame_size,
+                frame.world_landmarks, face_lms, self.frame_size,
                 hands_frame.left.world_landmarks if hands_frame.left.valid else None,
                 hands_frame.right.world_landmarks if hands_frame.right.valid else None,
+                # The 2D (picture) landmarks of the same pose: the solver lines them
+                # up with the 3D ones to work out where you stand (root translation).
+                image_landmarks=frame.landmarks,
             )
             self._last_valid_bone_transforms = raw_bones
             self._last_valid_world_landmarks = frame.world_landmarks
@@ -577,7 +584,9 @@ class Conductor:
     def _update_calibration(self, pose_frame: PoseFrame, face_frame: FaceFrame) -> None:
         face_lms = face_frame.landmarks if face_frame.valid else None
         state = self.pose_solver.update_calibration(
-            pose_frame.world_landmarks if pose_frame.valid else [], face_lms, self.frame_size)
+            pose_frame.world_landmarks if pose_frame.valid else [], face_lms, self.frame_size,
+            # Calibration also sets the root translation's origin and stride scale.
+            image_landmarks=pose_frame.landmarks if pose_frame.valid else None)
         if state.phase == "done" and self.calibration_state is not None \
                 and self.calibration_state.phase != "done":
             print(f"Calibrated over {state.samples} frames: lean offset {state.lean_offset_deg:+.1f} deg")
@@ -675,6 +684,9 @@ def main() -> None:
                               "for offline solver checks (tests/solver_checks.py)")
     parser.add_argument("--debug", action="store_true",
                          help="show a combined webcam + tracking-status debug window")
+    parser.add_argument("--no-root-translation", action="store_true",
+                        help="keep the character on the spot instead of following you "
+                             "around the room (root translation is on by default)")
     args = parser.parse_args()
  
     # Head pose model check disabled with head_pose_capture - see CLAUDE.md.
@@ -700,6 +712,7 @@ def main() -> None:
         pose_smoothing_alpha=args.pose_smoothing,
         show_debug=args.debug,
         record_path=args.record,
+        root_translation=not args.no_root_translation,
     )
     conductor.run()
  

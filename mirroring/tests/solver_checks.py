@@ -41,7 +41,8 @@ from landmark_recorder import Landmark, load_recording, to_landmarks  # noqa: E4
 from live_link_face_protocol import LiveLinkFaceEncoder, head_rotation_to_curves  # noqa: E402
 from mediapipe_pose_capture import PoseLandmark as P  # noqa: E402
 from pose_solver import (  # noqa: E402
-    BIND_POSES, BONE_NAMES, FINGER_AIM, FINGER_CHAIN, FULL_CHAIN, PTS_TO_COMPONENT, PoseSolver,
+    BIND_POSES, BONE_NAMES, FINGER_AIM, FINGER_CHAIN, FULL_CHAIN, PTS_TO_COMPONENT, ROOT_MAX_STEP_CM,
+    PoseSolver,
     HandLandmark as H,
 )
 
@@ -616,6 +617,167 @@ def check_face_channel_moves(recs: list[Path], rep: Report) -> None:
                   f"roll {spread[2]:.1f} deg over {len(curves)} frames (each must exceed 1 deg)")
 
 
+# ---- root translation -----------------------------------------------------------
+
+def _project(world: list[Landmark], cam_t: np.ndarray, fov_deg: float,
+             frame: tuple[int, int], confidence: float = 1.0) -> list[Landmark]:
+    """Pretend camera: take the 3D landmarks, shift them by cam_t (where the hips are,
+    seen from the camera, metres) and project them into pixels, then back to 0..1
+    image coordinates like MediaPipe's image landmarks.
+
+    Written out here on purpose rather than reusing the solver's camera_matrix(): if
+    the solver got the pinhole maths wrong, using its own matrix would hide that."""
+    w, h = frame
+    f = (w / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
+    out = []
+    for lm in world:
+        x, y, z = lm.x + cam_t[0], lm.y + cam_t[1], lm.z + cam_t[2]
+        u, v = f * x / z + w / 2.0, f * y / z + h / 2.0
+        out.append(Landmark(u / w, v / h, 0.0, confidence, confidence))
+    return out
+
+
+def _pelvis(bones: list) -> np.ndarray:
+    p = bones[0].position
+    return np.array([p["x"], p["y"], p["z"]])
+
+
+def check_root_translation(rep: Report) -> None:
+    """Synthetic: a known body at a known spot in front of a known camera. The
+    expected answers come from the conventions alone (CLAUDE.md: component X = the
+    character's left, Y = forward; MediaPipe's +x = the performer's left = the
+    picture's right), not from the solver's own mapping."""
+    print("\n2g. Root translation (synthetic camera)")
+    world = synth_pose(PoseSolver())
+    fov = 80.0
+    start = np.array([0.0, 0.0, 2.5])  # hips 2.5 m in front of the lens
+
+    def run(solver: PoseSolver, cam_t: np.ndarray, confidence: float = 1.0) -> np.ndarray:
+        img = _project(world, cam_t, fov, SYNTH_FRAME, confidence)
+        return _pelvis(solver.solve(world, None, SYNTH_FRAME, image_landmarks=img))
+
+    # Off means off: no image landmarks, or the switch off, gives exactly the old output.
+    old = PoseSolver().solve(world, None, SYNTH_FRAME)
+    img = _project(world, start, fov, SYNTH_FRAME)
+    rep.check(PoseSolver().solve(world, None, SYNTH_FRAME, image_landmarks=None) == old,
+              "without image landmarks the output is identical to before")
+    rep.check(PoseSolver(root_translation=False).solve(world, None, SYNTH_FRAME, image_landmarks=img) == old,
+              "with root_translation=False the output is identical to before")
+
+    solver = PoseSolver()
+    solver.camera_fov_deg = fov
+    home = run(solver, start)  # first frame = the origin
+    rep.check(np.allclose(home, _pelvis(old), atol=1e-6),
+              f"the first frame is the origin: pelvis unchanged ({home - _pelvis(old)} cm)")
+
+    # The PnP itself: does the solver find the spot the pretend camera was given?
+    t = solver._camera_translation(world, _project(world, start + [0.3, -0.1, 0.4], fov, SYNTH_FRAME), SYNTH_FRAME)
+    err = float(np.linalg.norm(t - (start + [0.3, -0.1, 0.4])) * 100.0)
+    rep.check(err < 0.01, f"solvePnP recovers the camera-space position ({err:.5f} cm)")
+
+    # Directions. Small steps (under the 20 cm step limit) so the limit plays no part.
+    left = run(solver, start + [0.15, 0.0, 0.0]) - home    # picture's right = performer's left
+    rep.check(abs(left[0] - 15.0) < 0.01 and abs(left[1]) < 0.01,
+              f"15 cm to the performer's left -> +15 cm X ({left[0]:+.3f}, {left[1]:+.3f})")
+    run(solver, start)  # back to the origin first, so this step stays under the step limit
+    closer = run(solver, start + [0.0, 0.0, -0.15]) - home  # toward the camera
+    rep.check(abs(closer[1] - 15.0) < 0.01 and abs(closer[0]) < 0.01,
+              f"15 cm toward the camera -> +15 cm Y ({closer[0]:+.3f}, {closer[1]:+.3f})")
+    rep.check(abs(closer[2]) < 1e-6, f"height untouched, it stays with ground lock ({closer[2]:+.6f} cm)")
+
+    # Gain scales the offset, live.
+    solver.root_gain = 2.0
+    doubled = run(solver, start + [0.0, 0.0, -0.15]) - home
+    solver.root_gain = 1.0
+    rep.check(abs(doubled[1] - 30.0) < 0.01, f"gain 2 doubles the offset ({doubled[1]:.3f} cm)")
+
+    # Lost hips: no confident points -> the character stays where it was last seen.
+    run(solver, start + [0.1, 0.0, 0.0])
+    frozen = run(solver, start + [1.0, 0.0, 0.0], confidence=0.0) - home
+    rep.check(abs(frozen[0] - 10.0) < 0.01, f"hips lost -> position frozen ({frozen[0]:.3f} cm, last seen 10)")
+
+    # Step limit: a 2 m jump in one frame moves only ROOT_MAX_STEP_CM.
+    before = run(solver, start + [0.1, 0.0, 0.0])
+    jumped = run(solver, start + [2.1, 0.0, 0.0])
+    rep.check(abs(jumped[0] - before[0] - ROOT_MAX_STEP_CM) < 0.01,
+              f"a one-frame 2 m jump moves only {jumped[0] - before[0]:.2f} cm (limit {ROOT_MAX_STEP_CM})")
+
+    # Re-centre: where you stand next becomes the centre; the character walks back to it.
+    solver.recentre_root()
+    for _ in range(30):
+        back = run(solver, start + [2.1, 0.0, 0.0]) - home
+    rep.check(np.allclose(back[:2], 0.0, atol=0.01), f"re-centre brings the character back to the centre "
+                                                     f"({back[0]:+.3f}, {back[1]:+.3f})")
+
+    # Ground lock as a live switch on the same solver: switched off, the height must be
+    # what a solver built with ground_lock=False gives; back on, the locked height again.
+    # (Not simply 95 cm: this synthetic body sits at the rig's real height instead of
+    # being hip-centred like MediaPipe's, and the unlocked height includes that.)
+    unlocked_ref = _pelvis(PoseSolver(ground_lock=False).solve(world, None, SYNTH_FRAME))[2]
+    solver.ground_lock = False
+    loose = run(solver, start + [2.1, 0.0, 0.0])
+    solver.ground_lock = True
+    locked = run(solver, start + [2.1, 0.0, 0.0])
+    rep.check(abs(loose[2] - unlocked_ref) < 1e-6 and abs(locked[2] - home[2]) < 1e-6,
+              f"ground lock switches live (off {loose[2]:.3f} = unlocked height, on {locked[2]:.3f})")
+
+    # Calibration sets the origin (averaged) and the stride scale. On the rig's own
+    # body the performer's hips are exactly Manny's height, so the scale must be 1.
+    cal = PoseSolver()
+    cal.camera_fov_deg = fov
+    cal.begin_calibration(countdown_s=0.0, samples=5, now_s=0.0)
+    for i in range(5):
+        cal.update_calibration(world, None, SYNTH_FRAME, now_s=1.0 + i,
+                               image_landmarks=_project(world, start + [0.5, 0.0, 0.0], fov, SYNTH_FRAME))
+    rep.check(abs(cal.root_stride_scale - 1.0) < 1e-6,
+              f"calibrating on Manny's own proportions gives stride scale 1 ({cal.root_stride_scale:.6f})")
+    at_origin = _pelvis(cal.solve(world, None, SYNTH_FRAME,
+                                  image_landmarks=_project(world, start + [0.5, 0.0, 0.0], fov, SYNTH_FRAME)))
+    rep.check(np.allclose(at_origin, _pelvis(old), atol=0.01),
+              f"after calibrating, the calibration spot is the centre ({at_origin - _pelvis(old)})")
+
+
+def check_root_translation_captures(recs: list[Path], rep: Report) -> None:
+    """On real captures: standing still must not wander, and the walk up to the
+    laptop at the end of each clip must read as coming closer."""
+    print("\n2h. Root translation on real captures")
+    if not recs:
+        print("  SKIPPED (no recordings)")
+        return
+    for path in recs:
+        rec = load_recording(path)
+        trims_file = path.parent / "trims.json"
+        trim = json.loads(trims_file.read_text()).get(path.name) if trims_file.exists() else None
+        frame_size = tuple(int(v) for v in rec["frame_size"])
+        solver = PoseSolver()
+        rows = []
+        for f in range(len(rec["t_ms"])):
+            if not rec["pose_valid"][f]:
+                continue
+            bones = solver.solve(to_landmarks(rec["pose_world"][f]), None, frame_size,
+                                 image_landmarks=to_landmarks(rec["pose_image"][f]))
+            rows.append((float(rec["t_ms"][f]), *_pelvis(bones)))
+        a = np.array(rows)
+        if trim is None:
+            print(f"  {path.name}: no trim window, skipped")
+            continue
+        win = a[(a[:, 0] >= trim["start_ms"]) & (a[:, 0] <= trim["end_ms"])]
+        sx, sy = float(win[:, 1].std()), float(win[:, 2].std())
+        # Measured 2026-10-15: rest.npz 0.22 / 1.16 cm, motion.npz 1.85 / 7.43 cm (that
+        # clip moves a lot, which is also why its depth wanders more - the pose bias
+        # in UnityMediaPipePose_Findings.md §7.2). Only the standing clip is asserted.
+        if path.name == "rest.npz":
+            rep.check(sx < 0.5 and sy < 2.0, f"{path.name}: standing still, the root wanders "
+                                             f"{sx:.2f} cm sideways, {sy:.2f} cm in depth (std; limits 0.5 / 2)")
+        else:
+            print(f"  {path.name}: root spread {sx:.2f} cm sideways, {sy:.2f} cm in depth (std, report)")
+        walk = a[a[:, 0] > trim["end_ms"]]
+        if len(walk) > 10:
+            gain = float(walk[-1, 2] - walk[0, 2])
+            rep.check(gain > 30.0, f"{path.name}: the walk up to the laptop reads as coming closer "
+                                   f"(+{gain:.1f} cm Y over {len(walk)} frames; must exceed 30)")
+
+
 def _stats(errs: list[float]) -> str:
     a = np.array([e for e in errs if not math.isnan(e)])
     if not a.size:
@@ -764,9 +926,11 @@ def main() -> int:
     check_ground_lock(rep)
     check_occlusion_gating(rep)
     check_face_channel_head(rep)
+    check_root_translation(rep)
 
     recs = args.recordings or sorted((ROOT / "recordings").glob("*.npz"))
     check_face_channel_moves(recs, rep)
+    check_root_translation_captures(recs, rep)
     if not recs:
         print("\n3. Absolute direction error - SKIPPED (no recordings; pass a .npz or add recordings/*.npz)")
     for path in recs:

@@ -64,7 +64,8 @@ The procedural lane runs from the module root as modules:
 ```
 
 The live lane and the GUI run **from `mirroring\`** (the `.task` models are looked up
-relative to the working directory, and `conductor.py` is not edited):
+relative to the working directory, and `conductor.py` is not edited without Malte's
+approval - the one approved edit so far is the root translation, see Open items):
 
 ```powershell
 ..\venv\Scripts\python.exe gui.py
@@ -792,12 +793,23 @@ and remove what is done.
   between `pose_solver` and the OSC encoder, off by default; driven live over a second
   OSC address space on the existing `UOSCServer`. Tag the current commit before fixing
   anything else; some artefacts are emergent and will not reproduce procedurally.
-- **Root translation (live lane).** MediaPipe world landmarks are hip-centred, so the
-  live character can never step, shift or jump. Needs image-space landmarks or a
-  separate position estimate. An architecture decision, not a tune. The procedural
-  lane already provides real root motion. Dollars shows the target shape (pelvis
-  position only, gain = hip visibility weight, light smoothing, glide to rest on loss);
-  its depth method stays unknown. See "Lessons from Dollars MONO".
+- **Root translation (live lane): v1 built 2026-10-15, branch `feat/root-translation`,
+  not yet run live.** `cv2.solvePnP` (SQPNP) of the pose's world landmarks against its
+  image landmarks (face + shoulders + hips, 0-12/23/24, confidence >= 0.5, >= 6 points),
+  method and measurements in `UnityMediaPipePose_Findings.md` §7. In `pose_solver.py`
+  ("root translation"); `solve()` / `update_calibration()` take an optional
+  `image_landmarks` keyword - without it the output is bit-identical (asserted, 2g).
+  `conductor.py` was edited for this, approved by Malte: it passes `frame.landmarks` and
+  has `--no-root-translation`. **On by default.** X/Y only; Z stays with ground lock
+  (now a live toggle). Origin = first frame, then Calibrate upright (30-frame mean) or
+  Re-centre. Stride scale = Manny hip height / performer's (at calibration, ~1.09 on
+  the recordings). FOV setting (default 80 deg = f 0.6·W) + gain; step limit 20 cm/frame.
+  Lost hips: frozen. GUI Tracking tab: on/off, ground lock, gain, FOV, Re-centre.
+  Measured on rest.npz: 0.22 cm sideways / 1.16 cm depth jitter (std).
+  **Deferred:** glide to the origin when the hips are lost (TODO in the code, Dollars
+  S5/S9); jump mode (needs `recordings\root_jump.npz`); One Euro filter; camera-pitch
+  levelling; absolute depth (FOV is a guess - a tape-grid recording would fix it);
+  watch for the off-axis turn (findings §7.7) once the character travels sideways.
 - **Face crop experiment.** Reinstate `head_pose_capture.py` on a crop around the
   pose-derived head. Only if the landmark-derived basis proves fragile.
 - **Knees converge.** The character's stance is narrower than the performer's (~0.65

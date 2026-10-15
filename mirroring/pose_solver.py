@@ -26,7 +26,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
-import opencv as cv
+# OpenCV's Python module is called cv2 (the pip package is opencv-contrib-python).
+# Only used for solvePnP in the root translation; see "root translation" below.
+import cv2
 from scipy.spatial.transform import Rotation as R
 import math
 import time
@@ -196,6 +198,29 @@ FULL_CHAIN: list[tuple] = [
 PTS_TO_COMPONENT = np.array([[0.0, -1.0, 0.0],
                              [1.0,  0.0, 0.0],
                              [0.0,  0.0, 1.0]])
+
+
+# ---- root translation settings ------------------------------------------------
+# Which pose landmarks feed solvePnP: the face (0-10), the shoulders (11, 12) and the
+# hips (23, 24). Arms and legs are left out on purpose: MediaPipe's 3D legs do not
+# project onto its own 2D legs (the ankles miss by ~72 px even standing still), and
+# with all 33 points the depth was 40% noisier on the recordings
+# (UnityMediaPipePose_Findings.md §7.2).
+ROOT_PNP_LANDMARKS: tuple[int, ...] = tuple(range(0, 13)) + (23, 24)
+# A landmark only counts if MediaPipe is at least this sure about it (visibility AND
+# presence) - the same 0.5 the occlusion gating uses.
+ROOT_MIN_CONFIDENCE = 0.5
+# solvePnP needs at least 4 points; 6 leaves some margin so one bad point cannot
+# decide the whole solve.
+ROOT_MIN_POINTS = 6
+# Default horizontal field of view of the webcam. 80 deg is what the Unity repo
+# assumed (focal length = 0.6 x image width). Depth scales directly with this guess:
+# a wider FOV reads you as closer, a narrower one as farther away.
+ROOT_DEFAULT_FOV_DEG = 80.0
+# Outlier guard: the root may move at most this far per solved frame (cm). At 30 fps
+# that is 6 m/s, faster than anyone walks, so real motion is never limited - only a
+# single-frame PnP glitch is. (The Unity repo used 5 m/s, Dollars 15 units/s.)
+ROOT_MAX_STEP_CM = 20.0
 
 
 def normalize(vec: np.ndarray) -> np.ndarray:
@@ -425,12 +450,35 @@ FINGER_AIM: dict[str, tuple] = {**FINGER_AIM_L, **FINGER_AIM_R}
 class PoseSolver:
     def __init__(self, pelvis_default_height_cm: float = 95.0,
                  torso_lean_offset_deg: float = 0.0,
-                 ground_lock: bool = True) -> None:
+                 ground_lock: bool = True,
+                 root_translation: bool = True) -> None:
         self.pelvis_default_height_cm = pelvis_default_height_cm
         # Derive the pelvis height from where the feet actually end up, instead of
         # pinning it. See _ground_locked_pelvis_z(). Set False to go back to the
         # fixed height (the character then floats or sinks with every crouch).
+        # Read on every solve(), so it can be switched live (the GUI does).
         self.ground_lock = ground_lock
+
+        # --- root translation (see _root_offset_cm) ---
+        # All of these are read on every solve(), so they can be changed live.
+        # On/off switch. Even when on, nothing happens unless solve() is given the
+        # image landmarks, so every caller that does not pass them (tests, the
+        # procedural lane, the rest-pose fallback) gets exactly the old output.
+        self.root_translation = root_translation
+        # Multiplies the whole offset: 1 = as measured, 0 = no travel, 2 = double.
+        self.root_gain = 1.0
+        # The camera's horizontal field of view, used to build the camera matrix.
+        self.camera_fov_deg = ROOT_DEFAULT_FOV_DEG
+        # Makes your steps fit Manny's legs: Manny's hip height / your hip height,
+        # measured by "Calibrate upright". 1.0 until then. The procedural lane does
+        # the same with Kimodo's skeleton (95.9 / 100 = 0.959).
+        self.root_stride_scale = 1.0
+        # Where you stood when the origin was taken, as solvePnP's camera-space
+        # translation (metres). None = take the next valid frame as the origin.
+        self._root_origin: np.ndarray | None = None
+        # The last offset that was sent (cm, component space, before the gain). Held
+        # when the hips are lost, and the start point for the step limit.
+        self._root_last_offset = np.zeros(3)
         # MediaPipe's world landmarks place the shoulders in front of the hips, so a
         # performer standing vertically is reported as leaning ~18 deg forward. The bias
         # is near-constant (measured +17.8 deg on a vertical subject and +20.0 deg on a
@@ -504,7 +552,8 @@ class PoseSolver:
     def update_calibration(self, raw_world_landmarks: list[Any],
                            face_landmarks: list[Any] | None = None,
                            image_size: tuple[int, int] | None = None,
-                           now_s: float | None = None) -> CalibrationState:
+                           now_s: float | None = None,
+                           image_landmarks: list[Any] | None = None) -> CalibrationState:
         """Drive one frame of a running calibration. Safe to call every frame; a
         no-op returning phase='idle' when none is running."""
         cal = self._cal
@@ -527,6 +576,12 @@ class PoseSolver:
             face_rot = (self._face_mesh_rotation(face_landmarks, image_size)
                         if face_landmarks and image_size else None)
             cal["faces"].append(face_rot)
+            # Root translation: where you stand (camera space) and how high your hips
+            # are above your feet, once per sampled frame. Either can be None (no
+            # image landmarks, or feet not seen well enough); those are skipped below.
+            cal.setdefault("root_t", []).append(
+                self._camera_translation(raw_world_landmarks, image_landmarks, image_size))
+            cal.setdefault("hip_heights", []).append(self._performer_hip_height_cm(raw_world_landmarks))
 
         if len(cal["leans"]) < cal["want"]:
             return CalibrationState("sampling", 0.0, len(cal["leans"]), cal["want"], self.torso_lean_offset_deg)
@@ -540,6 +595,16 @@ class PoseSolver:
         if rels:
             self.head_neutral = R.concatenate(rels).mean()
             self._head_rel = R.identity()
+        # Root translation: the averaged standing spot becomes the new origin (the
+        # centre of the Unreal stage), and the averaged hip height sets the stride
+        # scale. Averaging 30 frames, like the lean, so one jittery frame does not
+        # shift the whole stage.
+        root_ts = [t for t in cal.get("root_t", []) if t is not None]
+        if root_ts:
+            self._root_origin = np.mean(root_ts, axis=0)
+        hip_heights = [h for h in cal.get("hip_heights", []) if h is not None]
+        if hip_heights:
+            self.root_stride_scale = self._manny_hip_height_cm() / float(np.median(hip_heights))
         cal["done_at"] = now
         return CalibrationState("done", 0.0, len(cal["leans"]), cal["want"], self.torso_lean_offset_deg)
 
@@ -775,6 +840,165 @@ class PoseSolver:
         lowest = min(pos[b][2] for b in self.GROUND_CONTACT_BONES if b in pos)
         return float(pelvis_pos[2] + (self._rest_ground_z - lowest))
 
+    # -- root translation --------------------------------------------------------
+    # The problem: MediaPipe's world landmarks are measured from the middle of your
+    # hips, so they say how your body is bent but never WHERE you stand. Walk around
+    # and they stay the same. That is why the character never travelled.
+    #
+    # The idea (from the Unity repo, UnityMediaPipePose_Findings.md): MediaPipe gives
+    # the same body twice -
+    #   * world landmarks: 3D, in metres, centred on the hips  -> how big you are
+    #   * image landmarks: 2D, in pixels                        -> where you appear
+    # A body of known size that looks small is far away; one that sits to the left of
+    # the picture is to the left of the camera. cv2.solvePnP does exactly that sum:
+    # it finds the shift of the 3D body that makes it line up with the 2D picture.
+    # That shift is where your hips are, seen from the camera.
+    #
+    # solvePnP also returns a rotation; it is thrown away, because the world
+    # landmarks already contain the body's turn (measured: only 2-5 deg left over).
+
+    def camera_matrix(self, image_size: tuple[int, int]) -> np.ndarray:
+        """The pinhole camera model solvePnP needs, built from the FOV setting.
+
+        f is the focal length in pixels: how many pixels one unit of sideways offset
+        spans at one unit of distance. From the horizontal FOV:
+            tan(FOV / 2) = (half the image width) / f   ->   f = (w / 2) / tan(FOV / 2)
+        At 80 deg that is f = 0.6 x w, the Unity repo's guess. The optical centre is
+        assumed to be the middle of the picture, and pixels square (same f for x/y)."""
+        w, h = image_size
+        f = (w / 2.0) / math.tan(math.radians(self.camera_fov_deg) / 2.0)
+        return np.array([[f, 0.0, w / 2.0],
+                         [0.0, f, h / 2.0],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    def _camera_translation(self, raw_world_landmarks: list[Any],
+                            image_landmarks: list[Any] | None,
+                            image_size: tuple[int, int] | None) -> np.ndarray | None:
+        """Where the middle of your hips is, seen from the camera, in metres.
+
+        OpenCV's camera axes: x = right in the picture, y = DOWN in the picture,
+        z = straight away from the lens (so z is your distance). Returns None when it
+        cannot be measured: no image landmarks or size, too few confident points, or
+        solvePnP failing."""
+        if image_landmarks is None or image_size is None:
+            return None
+        n = len(PoseLandmark)
+        if len(raw_world_landmarks) < n or len(image_landmarks) < n:
+            return None
+        w, h = image_size
+
+        # Collect the same landmark twice: as a 3D point (metres) and as a 2D pixel.
+        object_points, image_points = [], []
+        for i in ROOT_PNP_LANDMARKS:
+            # Skip points MediaPipe is unsure about: when it cannot see something it
+            # still invents a position and only lowers these two numbers.
+            if _landmark_confidence(image_landmarks, (i,)) < ROOT_MIN_CONFIDENCE:
+                continue
+            wl, il = raw_world_landmarks[i], image_landmarks[i]
+            # World landmarks used as they are - NOT negated like the Unity repo did
+            # (that mirrors the body and moved the result by 12-26 cm, measured).
+            object_points.append((wl.x, wl.y, wl.z))
+            # Image landmarks are 0..1 of the picture; multiply up to pixels.
+            image_points.append((il.x * w, il.y * h))
+        if len(object_points) < ROOT_MIN_POINTS:
+            return None
+
+        # SQPNP: a solver that needs no starting guess and gives the best fit
+        # directly, so one bad frame cannot carry over into the next. ~15 us.
+        # No lens distortion assumed (None).
+        try:
+            ok, _rvec, tvec = cv2.solvePnP(
+                np.asarray(object_points, dtype=np.float64),
+                np.asarray(image_points, dtype=np.float64),
+                self.camera_matrix(image_size), None, flags=cv2.SOLVEPNP_SQPNP)
+        except cv2.error:
+            return None  # degenerate points (e.g. all on one line); treat as lost
+        if not ok:
+            return None
+        return np.asarray(tvec, dtype=np.float64).reshape(3)
+
+    def _root_offset_cm(self, raw_world_landmarks: list[Any],
+                        image_landmarks: list[Any] | None,
+                        image_size: tuple[int, int] | None) -> np.ndarray | None:
+        """How far you have moved from the origin, in Manny's component space (cm),
+        ready to add to the pelvis position. Z (height) is always 0: the height
+        stays with ground lock / the default pelvis height.
+
+        Returns None when root translation is off or the image landmarks are
+        missing - solve() then adds nothing, so its output is exactly the old one."""
+        if not self.root_translation or image_landmarks is None or image_size is None:
+            return None
+
+        t = self._camera_translation(raw_world_landmarks, image_landmarks, image_size)
+        if t is None:
+            # Hips lost this frame: keep the character where it was last seen.
+            # TODO(root glide): instead of freezing, hold briefly and then glide back
+            # to the origin, the way Dollars MONO does (REA_FINDINGS.md S5/S9: gain =
+            # hip visibility weight, 0.25 s hold + 0.25 s fade). Deferred, see CLAUDE.md.
+            return self._root_last_offset * self.root_gain
+
+        if self._root_origin is None:
+            # No origin yet (first frame after start, or after Re-centre): wherever
+            # you stand now becomes the centre of the stage.
+            self._root_origin = t
+
+        # Movement since the origin, still in camera axes (metres).
+        dx, dy, dz = t - self._root_origin
+        # Camera axes -> Manny's component space, in cm. The same mapping the solver
+        # applies to every landmark (see _convert_landmarks_to_ue_space and
+        # PTS_TO_COMPONENT: component = (lm.x, -lm.z, -lm.y) x 100), because the world
+        # landmarks share the camera's axes:
+        #   X (character's left)  = +dx : you step to the picture's right, which is
+        #                                 your left while you face the camera
+        #   Y (character's forward) = -dz : you step toward the camera
+        #   Z (up)                = -dy : not used, see the docstring
+        offset = np.array([dx, -dz, 0.0]) * 100.0
+        # Make your steps the length of Manny's steps (see root_stride_scale).
+        offset *= self.root_stride_scale
+
+        # Step limit: a jump of more than ROOT_MAX_STEP_CM in one frame is a glitch,
+        # not a step - move only that far toward it. A real fast move just takes a
+        # frame or two longer; a one-frame spike never shows.
+        step = offset - self._root_last_offset
+        step_len = float(np.linalg.norm(step))
+        if step_len > ROOT_MAX_STEP_CM:
+            offset = self._root_last_offset + step * (ROOT_MAX_STEP_CM / step_len)
+
+        self._root_last_offset = offset
+        return offset * self.root_gain
+
+    def recentre_root(self) -> None:
+        """Make the spot you stand on next the new centre of the stage. The GUI's
+        Re-centre button; "Calibrate upright" does the same, averaged over 30 frames.
+        The character then walks back to the centre (at most ROOT_MAX_STEP_CM per
+        frame) rather than jumping there."""
+        self._root_origin = None
+
+    def _manny_hip_height_cm(self) -> float:
+        """Manny's hip joints above his own floor in the bind pose (~89 cm): the
+        middle of the two thigh heads, minus the lowest foot point. Measured between
+        the same body points as _performer_hip_height_cm, so the ratio of the two is
+        a fair stride scale."""
+        fi = self.full_idx
+        hip_z = (self.rest_pos[fi["thigh_l"]][2] + self.rest_pos[fi["thigh_r"]][2]) * 0.5
+        return float(hip_z - self._rest_ground_z)
+
+    def _performer_hip_height_cm(self, raw_world_landmarks: list[Any]) -> float | None:
+        """Your hip joints above your lowest foot point (cm), from the world
+        landmarks. MediaPipe's y points DOWN, so the lowest foot point has the
+        largest y. None if the feet are not seen well enough to trust."""
+        if len(raw_world_landmarks) < len(PoseLandmark):
+            return None
+        feet = (_P.LEFT_ANKLE, _P.RIGHT_ANKLE, _P.LEFT_HEEL, _P.RIGHT_HEEL,
+                _P.LEFT_FOOT_INDEX, _P.RIGHT_FOOT_INDEX)
+        if _landmark_confidence(raw_world_landmarks, feet) < ROOT_MIN_CONFIDENCE:
+            return None
+        hip_y = (raw_world_landmarks[int(_P.LEFT_HIP)].y + raw_world_landmarks[int(_P.RIGHT_HIP)].y) * 0.5
+        lowest_y = max(raw_world_landmarks[int(i)].y for i in feet)
+        height = (lowest_y - hip_y) * 100.0
+        # A crouch or a bad frame can give nonsense; only trust a standing height.
+        return height if height > 40.0 else None
+
     def _rest_pose_output(self) -> list[BoneTransform]:
         return [BoneTransform(name=name, rotation=dict(BIND_POSES[i]), position=dict(BIND_POSITIONS[i]))
                 for i, name in enumerate(BONE_NAMES)]
@@ -956,11 +1180,15 @@ class PoseSolver:
     def solve(
         self,
         raw_world_landmarks: list[Any],
-        raw_image_landmarks: list[Any],
         face_landmarks: list[Any] | None = None,
         image_size: tuple[int, int] | None = None,
         left_hand_world_landmarks: list[Any] | None = None,
         right_hand_world_landmarks: list[Any] | None = None,
+        # The pose's IMAGE landmarks (PoseFrame.landmarks, 0..1 of the picture), for
+        # the root translation. Last and optional on purpose: every existing call
+        # passes its arguments by position, so a new parameter anywhere else would
+        # shift them all. Leave it out and solve() behaves exactly as before.
+        image_landmarks: list[Any] | None = None,
     ) -> list[BoneTransform]:
         solved = self._solve_body_globals(raw_world_landmarks, face_landmarks, image_size,
                                           left_hand_world_landmarks, right_hand_world_landmarks)
@@ -973,28 +1201,20 @@ class PoseSolver:
         # so the face channel is by construction the same head the body stream sends.
         self.head_rotation = global_rot[fi["head"]] * self.rest_global[fi["head"]].inv()
 
-        # Calculating the pelvis translation using OpenCV's solvePnP function to get the pelvis position in 3D space based on the landmarks.
-        # Webcam resolution
-        w, h = image_size
-        # Focal length assumed in width pixels
-        fx, fy = w
-        # Optical center assumed to be at the center of the image
-        cx = w / 2
-        cy = h / 2
-        # Camera Matrix
-        default_camera_matrix = np.array([
-            [fx,  0, cx],
-            [ 0, fy, cy],
-            [ 0,  0,  1]
-        ], dtype=np.float32)
-        # Distortion coefficients assumed to be zero (no lens distortion)
-        default_dist_coeffs = np.zeros((5, 1), dtype=np.float32)
-        pnp_success, rvec, tvec, _  = cv.solvePnP(raw_world_landmarks, raw_image_landmarks, default_camera_matrix, default_dist_coeffs)
-        pelvis_pos = hip_mid + np.array([tvec.x, tvec.z, self.pelvis_default_height_cm])
-        if pnp_success:
-            pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
+        # hip_mid is the middle of the hips in component space. MediaPipe's world
+        # landmarks are centred on the hips, so it is ~(0, 0, 0) every frame: on its
+        # own the pelvis never travels, it only gets the default height.
+        pelvis_pos = hip_mid + np.array([0.0, 0.0, self.pelvis_default_height_cm])
+        # Root translation: add how far you have walked (X/Y only, cm). None when it
+        # is off or there are no image landmarks - then nothing is added at all, so
+        # the output stays bit-for-bit what it was before root translation existed.
+        root_offset = self._root_offset_cm(raw_world_landmarks, image_landmarks, image_size)
+        if root_offset is not None:
+            pelvis_pos = pelvis_pos + root_offset
+        # Height last: ground lock only changes Z, so it works the same whether or not
+        # the pelvis was moved sideways above.
         if self.ground_lock:
-            pelvis_pos = np.array([pelvis_pos.x, pelvis_pos.y,
+            pelvis_pos = np.array([pelvis_pos[0], pelvis_pos[1],
                                    self._ground_locked_pelvis_z(global_rot, pelvis_pos)])
 
         result: list[BoneTransform] = []

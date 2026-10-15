@@ -71,6 +71,7 @@ from conductor import Conductor, LIVE_LINK_FACE_PORT, POSE_OSC_PORT
 from live_link_face_protocol import LiveLinkFaceEncoder  # read-only
 from live_link_pose_osc_protocol import LiveLinkPoseOSCEncoder  # read-only
 from mediapipe_holistic_capture import MediaPipeHolisticCapture
+from pose_solver import ROOT_DEFAULT_FOV_DEG  # read-only: the root translation's default FOV
 
 # The procedural lane lives beside mirroring/, at the module root (its own
 # procedural_animation/__init__.py does the mirror image of this for mirroring/).
@@ -272,7 +273,15 @@ class PipelineController:
                 face_smoothing_alpha=params["face_smoothing_alpha"],
                 pose_smoothing_alpha=params["pose_smoothing_alpha"],
                 show_debug=True,  # must stay True - see module docstring
+                root_translation=params.get("root_translation", True),
             )
+            # The other root translation settings are plain attributes on the solver
+            # (read every frame), so they are set here and changed live later by the
+            # Root translation panel. .get() with the defaults: callers that build
+            # params themselves (tests\gui_checks.py) need not know these keys.
+            conductor.pose_solver.ground_lock = params.get("ground_lock", True)
+            conductor.pose_solver.root_gain = params.get("root_gain", 1.0)
+            conductor.pose_solver.camera_fov_deg = params.get("camera_fov_deg", ROOT_DEFAULT_FOV_DEG)
         except Exception as exc:  # noqa: BLE001 - reported to the GUI thread, not swallowed
             self._construction_error = str(exc)
             return
@@ -1156,6 +1165,7 @@ class App:
 
         self._build_smoothing_group(scroll_body)
         self._build_calibration_group(scroll_body)
+        self._build_root_group(scroll_body)
         self._build_advanced_group(scroll_body)
 
         bottom = ttk.Frame(right, style="Panel.TFrame")
@@ -1221,6 +1231,82 @@ class App:
         spin.pack(side="right")
         spin.bind("<Return>", lambda _e: self._on_torso_lean_changed())
         spin.bind("<FocusOut>", lambda _e: self._on_torso_lean_changed())
+
+    def _build_root_group(self, parent: tk.Widget) -> None:
+        """Root translation: whether the character walks around when you do, and
+        how. Every control here is live (no restart): each one just sets an
+        attribute on the running solver, which reads it on the next frame."""
+        group = ttk.LabelFrame(parent, text="Root translation")
+        group.pack(fill="x", padx=8, pady=4)
+        body = ttk.Frame(group, style="Panel.TFrame")
+        body.pack(fill="x", padx=8, pady=8)
+
+        # On/off: off keeps the character on the spot, as before root translation.
+        self.root_translation_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Follow me around the room (default on)",
+                        variable=self.root_translation_var,
+                        command=self._on_root_settings_changed).pack(anchor="w")
+        # Ground lock: keeps the lower foot on the floor (pelvis height follows the
+        # feet). Off = the pelvis sits at a fixed height, so a crouch lifts the feet.
+        self.ground_lock_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Ground lock: feet stay on the floor (default on)",
+                        variable=self.ground_lock_var,
+                        command=self._on_root_settings_changed).pack(anchor="w")
+
+        # Gain: 1 = as measured, 0 = no travel, 2 = twice as far as you walk.
+        self.root_gain_slider = LabeledSlider(
+            body, "Travel gain", from_=0.0, to=2.0, initial=1.0,
+            on_change=lambda _v: self._on_root_settings_changed(),
+        )
+        self.root_gain_slider.pack(fill="x", pady=(6, 0))
+
+        # Camera field of view. The distance to the camera is worked out from how
+        # big you look, so a wrong FOV scales the depth: if walking toward the camera
+        # moves the character too little, try a smaller FOV, too much, a larger one.
+        row = ttk.Frame(body, style="Panel.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="Camera FOV, horizontal (deg)", style="Body.TLabel").pack(side="left")
+        self.camera_fov_var = tk.DoubleVar(value=ROOT_DEFAULT_FOV_DEG)
+        spin = ttk.Spinbox(row, from_=30.0, to=150.0, increment=1.0, width=6,
+                           textvariable=self.camera_fov_var, command=self._on_root_settings_changed)
+        spin.pack(side="right")
+        spin.bind("<Return>", lambda _e: self._on_root_settings_changed())
+        spin.bind("<FocusOut>", lambda _e: self._on_root_settings_changed())
+
+        # Re-centre: where you stand now becomes the middle of the stage. ("Calibrate
+        # upright" does this too, averaged over its 30 frames.)
+        ttk.Button(body, text="Re-centre here", command=self._on_recentre_root).pack(fill="x", pady=(8, 0))
+
+    def _root_settings(self) -> dict | None:
+        """The panel's current values, as the params keys _run() reads. None while a
+        field holds something that is not a number (mid-typing)."""
+        try:
+            fov = float(self.camera_fov_var.get())
+        except (tk.TclError, ValueError):
+            return None
+        return dict(
+            root_translation=bool(self.root_translation_var.get()),
+            ground_lock=bool(self.ground_lock_var.get()),
+            root_gain=float(self.root_gain_slider.var.get()),
+            # Clamp: at 0 or 180 deg the camera maths divides by zero / infinity.
+            camera_fov_deg=min(max(fov, 10.0), 170.0),
+        )
+
+    def _on_root_settings_changed(self) -> None:
+        settings = self._root_settings()
+        if settings is None or self.controller.conductor is None:
+            return  # not running: the values are picked up at the next Start
+        solver = self.controller.conductor.pose_solver
+        solver.root_translation = settings["root_translation"]
+        solver.ground_lock = settings["ground_lock"]
+        solver.root_gain = settings["root_gain"]
+        solver.camera_fov_deg = settings["camera_fov_deg"]
+
+    def _on_recentre_root(self) -> None:
+        if self.controller.conductor is None:
+            messagebox.showinfo("Re-centre", "Start the pipeline first.")
+            return
+        self.controller.conductor.pose_solver.recentre_root()
 
     def _build_advanced_group(self, parent: tk.Widget) -> None:
         section = CollapsibleSection(parent, "Advanced", start_expanded=False)
@@ -1605,6 +1691,13 @@ class App:
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid input", f"Could not parse a field: {exc}")
             return None
+        # Root translation panel: carried into the new Conductor, so a (re)start keeps
+        # what is set there.
+        root_settings = self._root_settings()
+        if root_settings is None:
+            messagebox.showerror("Invalid input", "Camera FOV is not a number")
+            return None
+        params.update(root_settings)
 
         for label, path in (("Holistic model", params["holistic_model"]),
                              # ("Head-pose model", params["head_pose_model"]),  # disabled - see CLAUDE.md
